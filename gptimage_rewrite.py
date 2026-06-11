@@ -440,11 +440,18 @@ class OpenAIGPTImageSettings:
                 ], {
                     "default": "1024x1024",
                 }),
+                "n": ("INT", {
+                    "default": 1,
+                    "min": 1,
+                    "max": 8,
+                    "step": 1,
+                    "display": "number",
+                }),
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("model", "quality", "background", "size")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "INT")
+    RETURN_NAMES = ("model", "quality", "background", "size", "n")
     FUNCTION = "get_settings"
     CATEGORY = "KASKI/api-adaptions/openai"
 
@@ -454,11 +461,18 @@ class OpenAIGPTImageSettings:
         quality: str,
         background: str,
         size: str,
+        n: int,
     ):
         model = normalize_gpt_image_model(model)
         quality = normalize_gpt_image_quality(quality)
         background = normalize_gpt_image_background(background)
         size = normalize_gpt_image_size(size)
+
+        if not isinstance(n, int):
+            raise TypeError("n must be an integer")
+
+        if n < 1 or n > 8:
+            raise ValueError("n must be between 1 and 8")
 
         if model in ("gpt-image-1", "gpt-image-1.5"):
             if size not in VALID_GPT_IMAGE_1_SIZES:
@@ -467,7 +481,7 @@ class OpenAIGPTImageSettings:
         if model == "gpt-image-2" and background == "transparent":
             raise ValueError("Transparent background is not supported for GPT Image 2 model")
 
-        return (model, quality, background, size)
+        return (model, quality, background, size, n)
 
 
 OPENAI_GPT_IMAGE_REWRITE_NODE_CLASS_MAPPINGS = {
