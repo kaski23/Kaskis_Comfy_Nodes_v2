@@ -214,7 +214,7 @@ class GeminiImage2(IO.ComfyNode):
         return IO.Schema(
             node_id="NanobananaPro_KASKI",
             display_name="Nanobanana Pro IO-unlocked",
-            category="KASKI/api-adaptions",
+            category="KASKI/api-adaptions/nanobanana",
             description="Generate or edit images synchronously via Google Vertex API.",
             inputs=[
                 IO.String.Input(
@@ -411,7 +411,7 @@ class GeminiSettings:
     RETURN_TYPES = ("STRING", "STRING", "STRING")
     RETURN_NAMES = ("aspect_ratio", "resolution", "response_modalities")
     FUNCTION = "get_settings"
-    CATEGORY = "KASKI/api-adaptions"
+    CATEGORY = "KASKI/api-adaptions/nanobanana"
 
     def get_settings(self, aspect_ratio, resolution, response_modalities):
         # hard validation
@@ -450,3 +450,15 @@ class GeminiSettings:
         return (aspect_ratio, resolution, response_modalities)
         
 
+
+
+NANOBANANA_REWRITE_NODE_CLASS_MAPPINGS = {
+    "NanobananaPro_KASKI": GeminiImage2,
+    "NanobananaSettings_KASKI": GeminiSettings,
+}
+
+
+NANOBANANA_REWRITE_NODE_DISPLAY_NAME_MAPPINGS = {
+    "NanobananaPro_KASKI": "Nanobanana Pro IO-unlocked",
+    "NanobananaSettings_KASKI": "Nanobanana Settings",
+}
