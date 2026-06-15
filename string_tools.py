@@ -1,5 +1,55 @@
 import re
 
+### JSON-String-Tools
+
+class JsonStringTool:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "key": ("STRING", {"default": "", "multiline": False}),
+                "value": ("STRING", {"default": "", "multiline": True}),
+                "nested": ("BOOLEAN", {"default": False}),
+            }
+        }
+        
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("JSON-String",)
+    FUNCTION = "create_json_string"
+
+    def create_json_string(self, key, value, nested):
+        # key reformatting
+        key = key.strip('"').rstrip(":").strip()
+        key = '"' + key + "\": "
+
+        
+        # value reformatting
+        value = value.strip()
+        
+        if value[0] not in ['"', '{', '[']:
+            value = '"' + value
+        if value[-2] not in ['"', '}', ']'] or value[-1] != ",":
+            if value[-1] in ['"', '}', ']']:
+                value = value + ','
+            else:
+                value = value + "\","
+        
+        if nested:
+            if value[0] != '{':
+                value = "{\n" + value
+            if value[-2] != '}' or value[-1] != ",":
+                if value[-1] == '}':
+                    value = value + ','
+                else:
+                    value = value + "\n},"
+            
+            
+        json_string = key + value + "\n"
+        
+        return (json_string,)
+
+
+
 ### GENERAL STRING TOOLS
 
 
@@ -360,6 +410,8 @@ class ExtractShotID:
 # MAPPING-DICTS
 
 STRING_TOOLS_NODE_CLASS_MAPPINGS = {
+    "JsonStringTool_KASKI": JsonStringTool,
+
     "StringSplitAtSymbol_KASKI": StringSplitAtSymbol,
     "JoinStrings_KASKI": JoinStrings,
     "NumberToString_KASKI": NumberToString,
@@ -373,6 +425,8 @@ STRING_TOOLS_NODE_CLASS_MAPPINGS = {
 }
     
 STRING_TOOLS_NODE_DISPLAY_NAME_MAPPINGS = {
+        "JsonStringTool_KASKI": "JSON Key-Value String",
+
     "StringSplitAtSymbol_KASKI": "String Split at Symbol",
     "JoinStrings_KASKI": "Join Strings",
     "NumberToString_KASKI": "Number to String",
