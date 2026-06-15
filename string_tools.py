@@ -12,40 +12,38 @@ class JsonStringTool:
                 "nested": ("BOOLEAN", {"default": False}),
             }
         }
-        
+
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("JSON-String",)
     FUNCTION = "create_json_string"
 
     def create_json_string(self, key, value, nested):
-        # key reformatting
-        key = key.strip('"').rstrip(":").strip()
-        key = '"' + key + "\": "
-
-        
-        # value reformatting
+        key = key.strip().strip('"').rstrip(":").strip()
         value = value.strip()
-        
-        if value[0] not in ['"', '{', '[']:
-            value = '"' + value
-        if value[-2] not in ['"', '}', ']'] or value[-1] != ",":
-            if value[-1] in ['"', '}', ']']:
-                value = value + ','
-            else:
-                value = value + "\","
-        
+
+        if not key:
+            return ("",)
+
+        # Value absichern
+        if not value:
+            value = '""'
+        else:
+            starts_structured = value[0] in ['"', '{', '[']
+            ends_structured = value[-1] in ['"', '}', ']']
+
+            if not starts_structured:
+                value = '"' + value
+
+            if not ends_structured:
+                value = value + '"'
+
+        # Nested wrapping
         if nested:
-            if value[0] != '{':
-                value = "{\n" + value
-            if value[-2] != '}' or value[-1] != ",":
-                if value[-1] == '}':
-                    value = value + ','
-                else:
-                    value = value + "\n},"
-            
-            
-        json_string = key + value + "\n"
-        
+            if not value.startswith("{"):
+                value = "{\n" + value + "\n}"
+
+        json_string = f'"{key}": {value},\n'
+
         return (json_string,)
 
 
