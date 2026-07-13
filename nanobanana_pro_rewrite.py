@@ -224,9 +224,10 @@ class GeminiImage2(IO.ComfyNode):
                     "Include any constraints, styles, or details the model should follow.",
                     default="",
                 ),
-                IO.Combo.Input(
+                IO.String.Input(
                     "model",
-                    options=["gemini-3-pro-image-preview"],
+                    default="gemini-3-pro-image-preview",
+                    tooltip="Choose between gemini-3-pro-image-preview and Nano Banana 2 (Gemini 3.1 Flash Image)",
                 ),
                 IO.Int.Input(
                     "seed",
@@ -393,6 +394,12 @@ class GeminiSettings:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "model": ([
+                    "gemini-3-pro-image-preview", 
+                    "Nano Banana 2 (Gemini 3.1 Flash Image)"
+                ], {
+                    "default": "gemini-3-pro-image-preview"
+                }),
                 "aspect_ratio": ([
                     "auto", "1:1", "2:3", "3:2", "3:4", "4:3",
                     "4:5", "5:4", "9:16", "16:9", "21:9"
@@ -408,13 +415,14 @@ class GeminiSettings:
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING")
-    RETURN_NAMES = ("aspect_ratio", "resolution", "response_modalities")
+    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("model","aspect_ratio", "resolution", "response_modalities")
     FUNCTION = "get_settings"
     CATEGORY = "KASKI/api-adaptions/nanobanana"
 
-    def get_settings(self, aspect_ratio, resolution, response_modalities):
+    def get_settings(self, model, aspect_ratio, resolution, response_modalities):
         # hard validation
+        valid_models = {"gemini-3-pro-image-preview", "Nano Banana 2 (Gemini 3.1 Flash Image)"}
 
         valid_aspect_ratios = {
             "auto", "1:1", "2:3", "3:2", "3:4", "4:3",
@@ -422,6 +430,14 @@ class GeminiSettings:
         }
         valid_resolutions = {"1K", "2K", "4K"}
         valid_modalities = {"IMAGE", "IMAGE+TEXT"}
+        
+        if not isinstance(model, str):
+            raise TypeError("model must be a string")
+        model = model.strip().lower()
+        if not model:
+            raise ValueError("model must not be empty")
+        if model not in valid_models:
+            raise ValueError(f"Invalid valid_models '{valid_models}'")
 
         if not isinstance(aspect_ratio, str):
             raise TypeError("aspect_ratio must be a string")
@@ -447,7 +463,7 @@ class GeminiSettings:
         if response_modalities not in valid_modalities:
             raise ValueError(f"Invalid response_modalities '{response_modalities}'")
 
-        return (aspect_ratio, resolution, response_modalities)
+        return (model, aspect_ratio, resolution, response_modalities)
         
 
 
