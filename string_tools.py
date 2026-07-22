@@ -1,5 +1,7 @@
 import re
 
+from comfy_api.latest import IO
+
 ### JSON-String-Tools
 
 class JsonStringTool:
@@ -79,25 +81,52 @@ class StringSplitAtSymbol:
             return ("",)
 
            
-class JoinStrings:
+class JoinStrings(IO.ComfyNode):
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "string_a": ("STRING",),
-                "string_b": ("STRING",),
-                "delimiter": ("STRING", {"default": "_", "multiline": False}),
-            }
-        }
+    def define_schema(cls):
+        return IO.Schema(
+            node_id="JoinStrings_KASKI",
+            display_name="Join Strings",
+            category="KASKI/stringtools",
+            inputs=[
+                IO.Autogrow.Input(
+                    "strings",
+                    template=IO.Autogrow.TemplatePrefix(
+                        input=IO.String.Input(
+                            "string",
+                            force_input=True,
+                        ),
+                        prefix="string_",
+                        min=2,
+                        max=50,
+                    ),
+                ),
+                IO.String.Input(
+                    "delimiter",
+                    default="_",
+                    multiline=False,
+                ),
+            ],
+            outputs=[
+                IO.String.Output(
+                    display_name="joined string",
+                ),
+            ],
+        )
 
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("joined string",)
-    FUNCTION = "join"
-    CATEGORY = "KASKI/stringtools"
+    @classmethod
+    def execute(
+        cls,
+        strings: IO.Autogrow.Type,
+        delimiter: str,
+    ) -> IO.NodeOutput:
+        values = [
+            value
+            for value in strings.values()
+            if value is not None
+        ]
 
-    def join(self, string_a: str, string_b: str, delimiter: str):
-        out = f"{string_a}{delimiter}{string_b}"
-        return (out,)
+        return IO.NodeOutput(delimiter.join(values))
 
 class NumberToString:
     @classmethod

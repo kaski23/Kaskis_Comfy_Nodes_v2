@@ -1,10 +1,13 @@
 import base64
+import traceback
 from io import BytesIO
+from typing import Any
 
 import numpy as np
 import torch
 from PIL import Image
 
+from comfy.utils import common_upscale
 from comfy_api.latest import IO, Input
 from comfy_api_nodes.apis.openai import (
     OpenAIImageEditRequest,
@@ -20,6 +23,10 @@ from comfy_api_nodes.util import (
 )
 
 
+CATEGORY = "KASKI/api-adaptions/openai"
+SETTINGS_TYPE = "KASKI_GPT_IMAGE_SETTINGS"
+MAX_REFERENCE_IMAGES = 16
+
 VALID_GPT_IMAGE_MODELS = {
     "gpt-image-1",
     "gpt-image-1.5",
@@ -32,13 +39,18 @@ VALID_GPT_IMAGE_QUALITIES = {
     "high",
 }
 
-VALID_GPT_IMAGE_BACKGROUNDS = {
+GPT_IMAGE_2_BACKGROUNDS = {
+    "auto",
+    "opaque",
+}
+
+LEGACY_GPT_IMAGE_BACKGROUNDS = {
     "auto",
     "opaque",
     "transparent",
 }
 
-VALID_GPT_IMAGE_SIZES = {
+GPT_IMAGE_2_SIZES = {
     "auto",
     "1024x1024",
     "1024x1536",
@@ -48,9 +60,10 @@ VALID_GPT_IMAGE_SIZES = {
     "1152x2048",
     "3840x2160",
     "2160x3840",
+    "Custom",
 }
 
-VALID_GPT_IMAGE_1_SIZES = {
+LEGACY_GPT_IMAGE_SIZES = {
     "auto",
     "1024x1024",
     "1024x1536",
@@ -73,133 +86,409 @@ async def validate_and_cast_response(
             img_io = BytesIO(base64.b64decode(img_data.b64_json))
         elif img_data.url:
             img_io = BytesIO()
-            await download_url_to_bytesio(img_data.url, img_io, timeout=timeout)
+            await download_url_to_bytesio(
+                img_data.url,
+                img_io,
+                timeout=timeout,
+            )
         else:
-            raise ValueError("Invalid image payload – neither URL nor base64 data present.")
+            raise ValueError(
+                "Invalid image payload – neither URL nor base64 data present."
+            )
 
         pil_img = Image.open(img_io).convert("RGBA")
         arr = np.asarray(pil_img).astype(np.float32) / 255.0
         image_tensors.append(torch.from_numpy(arr))
 
+    # size="auto" can return images whose dimensions differ slightly.
+    # ComfyUI batches must have one consistent tensor shape, so match the
+    # current upstream behavior and resize every result to the first image.
+    ref_h, ref_w = image_tensors[0].shape[:2]
+    for index, tensor in enumerate(image_tensors):
+        if tensor.shape[:2] == (ref_h, ref_w):
+            continue
+
+        samples = tensor.unsqueeze(0).movedim(-1, 1)
+        samples = common_upscale(
+            samples,
+            ref_w,
+            ref_h,
+            "bilinear",
+            "center",
+        )
+        image_tensors[index] = samples.movedim(1, -1).squeeze(0)
+
     return torch.stack(image_tensors, dim=0)
 
 
-def calculate_tokens_price_image_1(response: OpenAIImageGenerationResponse) -> float | None:
-    return ((response.usage.input_tokens * 10.0) + (response.usage.output_tokens * 40.0)) / 1_000_000.0
+def calculate_tokens_price_image_1(
+    response: OpenAIImageGenerationResponse,
+) -> float | None:
+    return (
+        (response.usage.input_tokens * 10.0)
+        + (response.usage.output_tokens * 40.0)
+    ) / 1_000_000.0
 
 
-def calculate_tokens_price_image_1_5(response: OpenAIImageGenerationResponse) -> float | None:
-    return ((response.usage.input_tokens * 8.0) + (response.usage.output_tokens * 32.0)) / 1_000_000.0
+def calculate_tokens_price_image_1_5(
+    response: OpenAIImageGenerationResponse,
+) -> float | None:
+    return (
+        (response.usage.input_tokens * 8.0)
+        + (response.usage.output_tokens * 32.0)
+    ) / 1_000_000.0
 
 
-def calculate_tokens_price_image_2_0(response: OpenAIImageGenerationResponse) -> float | None:
-    return ((response.usage.input_tokens * 8.0) + (response.usage.output_tokens * 30.0)) / 1_000_000.0
+def calculate_tokens_price_image_2_0(
+    response: OpenAIImageGenerationResponse,
+) -> float | None:
+    return (
+        (response.usage.input_tokens * 8.0)
+        + (response.usage.output_tokens * 30.0)
+    ) / 1_000_000.0
 
 
-def normalize_gpt_image_model(model: str) -> str:
-    if not isinstance(model, str):
-        raise TypeError("model must be a string")
-
-    model = model.strip()
-
-    if not model:
-        raise ValueError("model must not be empty")
-
-    if model not in VALID_GPT_IMAGE_MODELS:
-        raise ValueError(f"Invalid model '{model}'. Allowed: {VALID_GPT_IMAGE_MODELS}")
-
-    return model
+def _black_image(width: int = 1024, height: int = 1024) -> torch.Tensor:
+    return torch.zeros((1, height, width, 4), dtype=torch.float32)
 
 
-def normalize_gpt_image_quality(quality: str) -> str:
+def _log_soft_error(where: str, error: Exception) -> None:
+    print(f"[KASKI GPTImage2] {where}: {type(error).__name__}: {error}")
+    traceback.print_exc()
+
+
+def _validate_custom_size(width: int, height: int) -> None:
+    if type(width) is not int or type(height) is not int:
+        raise TypeError("custom_width and custom_height must be integers.")
+
+    if not 1024 <= width <= 3840 or not 1024 <= height <= 3840:
+        raise ValueError(
+            "Custom width and height must each be between 1024 and 3840; "
+            f"received {width}x{height}."
+        )
+
+    if width % 16 != 0 or height % 16 != 0:
+        raise ValueError(
+            "Custom width and height must be multiples of 16; "
+            f"received {width}x{height}."
+        )
+
+    if max(width, height) > 3840:
+        raise ValueError(
+            "Custom resolution max edge must be <= 3840; "
+            f"received {width}x{height}."
+        )
+
+    ratio = max(width, height) / min(width, height)
+    if ratio > 3:
+        raise ValueError(
+            "Custom resolution aspect ratio must not exceed 3:1; "
+            f"received {width}x{height}."
+        )
+
+    total_pixels = width * height
+    if not 655_360 <= total_pixels <= 8_294_400:
+        raise ValueError(
+            "Custom resolution total pixels must be between 655,360 and "
+            f"8,294,400; received {total_pixels}."
+        )
+
+
+def _validate_settings(settings: Any) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        raise TypeError(
+            "settings must come from the OpenAI GPT Image Settings node."
+        )
+
+    required_keys = {
+        "model_id",
+        "quality",
+        "background",
+        "size",
+        "custom_width",
+        "custom_height",
+        "n",
+    }
+    missing_keys = required_keys.difference(settings)
+    if missing_keys:
+        raise ValueError(
+            "Settings object is incomplete. Missing: "
+            + ", ".join(sorted(missing_keys))
+        )
+
+    normalized = dict(settings)
+
+    model_id = normalized["model_id"]
+    quality = normalized["quality"]
+    background = normalized["background"]
+    size = normalized["size"]
+    custom_width = normalized["custom_width"]
+    custom_height = normalized["custom_height"]
+    n = normalized["n"]
+
+    if not isinstance(model_id, str) or model_id not in VALID_GPT_IMAGE_MODELS:
+        raise ValueError(
+            f"Invalid model '{model_id}'. Allowed: "
+            f"{sorted(VALID_GPT_IMAGE_MODELS)}"
+        )
+
     if not isinstance(quality, str):
-        raise TypeError("quality must be a string")
-
+        raise TypeError("quality must be a string.")
     quality = quality.strip().lower()
-
-    if not quality:
-        raise ValueError("quality must not be empty")
-
     if quality not in VALID_GPT_IMAGE_QUALITIES:
-        raise ValueError(f"Invalid quality '{quality}'. Allowed: {VALID_GPT_IMAGE_QUALITIES}")
+        raise ValueError(
+            f"Invalid quality '{quality}'. Allowed: "
+            f"{sorted(VALID_GPT_IMAGE_QUALITIES)}"
+        )
 
-    return quality
-
-
-def normalize_gpt_image_background(background: str) -> str:
     if not isinstance(background, str):
-        raise TypeError("background must be a string")
-
+        raise TypeError("background must be a string.")
     background = background.strip().lower()
 
-    if not background:
-        raise ValueError("background must not be empty")
-
-    if background not in VALID_GPT_IMAGE_BACKGROUNDS:
-        raise ValueError(f"Invalid background '{background}'. Allowed: {VALID_GPT_IMAGE_BACKGROUNDS}")
-
-    return background
-
-
-def normalize_gpt_image_size(size: str) -> str:
     if not isinstance(size, str):
-        raise TypeError("size must be a string")
+        raise TypeError("size must be a string.")
+    size = size.strip()
 
-    size = size.strip().lower()
+    if type(n) is not int or not 1 <= n <= 8:
+        raise ValueError("n must be an integer between 1 and 8.")
 
-    if not size:
-        raise ValueError("size must not be empty")
+    if model_id == "gpt-image-2":
+        if background not in GPT_IMAGE_2_BACKGROUNDS:
+            raise ValueError(
+                "GPT Image 2 supports only auto or opaque backgrounds."
+            )
 
-    if size not in VALID_GPT_IMAGE_SIZES:
-        raise ValueError(f"Invalid size '{size}'. Allowed: {VALID_GPT_IMAGE_SIZES}")
+        if size not in GPT_IMAGE_2_SIZES:
+            raise ValueError(
+                f"Invalid GPT Image 2 size '{size}'. Allowed: "
+                f"{sorted(GPT_IMAGE_2_SIZES)}"
+            )
 
-    return size
+        if size == "Custom":
+            _validate_custom_size(custom_width, custom_height)
+    else:
+        if background not in LEGACY_GPT_IMAGE_BACKGROUNDS:
+            raise ValueError(
+                f"Invalid legacy GPT Image background '{background}'."
+            )
+
+        if size not in LEGACY_GPT_IMAGE_SIZES:
+            raise ValueError(
+                f"Resolution '{size}' is only supported by GPT Image 2."
+            )
+
+        if custom_width is not None or custom_height is not None:
+            raise ValueError(
+                "custom_width and custom_height must be None for "
+                f"{model_id}."
+            )
+
+    normalized.update(
+        {
+            "model_id": model_id,
+            "quality": quality,
+            "background": background,
+            "size": size,
+            "n": n,
+        }
+    )
+    return normalized
 
 
-class OpenAIGPTImage1(IO.ComfyNode):
+def _default_settings() -> dict[str, Any]:
+    return {
+        "model_id": "gpt-image-2",
+        "quality": "low",
+        "background": "auto",
+        "size": "auto",
+        "custom_width": 1024,
+        "custom_height": 1024,
+        "n": 1,
+    }
 
+
+def _resolve_request_size(settings: dict[str, Any]) -> str:
+    if settings["size"] != "Custom":
+        return settings["size"]
+
+    width = settings["custom_width"]
+    height = settings["custom_height"]
+    _validate_custom_size(width, height)
+    return f"{width}x{height}"
+
+
+def _price_extractor_for_model(model_id: str):
+    if model_id == "gpt-image-1":
+        return calculate_tokens_price_image_1
+    if model_id == "gpt-image-1.5":
+        return calculate_tokens_price_image_1_5
+    if model_id == "gpt-image-2":
+        return calculate_tokens_price_image_2_0
+    raise ValueError(f"Unknown model: {model_id}")
+
+
+def _collect_image_tensors(
+    images: (
+        Input.Image
+        | list[Input.Image]
+        | dict[str, Input.Image]
+        | None
+    ),
+) -> list[torch.Tensor]:
+    if images is None:
+        return []
+
+    if isinstance(images, dict):
+        image_values = [
+            tensor for tensor in images.values() if tensor is not None
+        ]
+    elif isinstance(images, list):
+        image_values = [tensor for tensor in images if tensor is not None]
+    else:
+        image_values = [images]
+
+    flat: list[torch.Tensor] = []
+    for tensor in image_values:
+        if len(tensor.shape) == 4:
+            flat.extend(
+                tensor[index : index + 1]
+                for index in range(tensor.shape[0])
+            )
+        elif len(tensor.shape) == 3:
+            flat.append(tensor.unsqueeze(0))
+        else:
+            raise ValueError(
+                "Reference images must be HWC or batched BHWC tensors."
+            )
+
+    if len(flat) > MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"GPT Image supports at most {MAX_REFERENCE_IMAGES} reference "
+            f"images; received {len(flat)}."
+        )
+
+    return flat
+
+
+def _settings_inputs_for_legacy_model() -> list[Input]:
+    return [
+        IO.Combo.Input(
+            "size",
+            default="auto",
+            options=[
+                "auto",
+                "1024x1024",
+                "1024x1536",
+                "1536x1024",
+            ],
+            tooltip="Image size.",
+        ),
+        IO.Combo.Input(
+            "background",
+            default="auto",
+            options=["auto", "opaque", "transparent"],
+            tooltip="Return image with or without a transparent background.",
+        ),
+        IO.Combo.Input(
+            "quality",
+            default="low",
+            options=["low", "medium", "high"],
+            tooltip="Image quality, affecting cost and generation time.",
+        ),
+    ]
+
+
+class OpenAIGPTImageSettings(IO.ComfyNode):
     @classmethod
     def define_schema(cls):
         return IO.Schema(
-            node_id="OpenAIGPTImage1_KASKI",
-            display_name="OpenAI GPT Image IO-unlocked",
-            category="KASKI/api-adaptions/openai",
-            description="Generate or edit images synchronously via OpenAI's GPT Image endpoint.",
+            node_id="OpenAIGPTImageSettings_KASKI",
+            display_name="OpenAI GPT Image Settings",
+            category=CATEGORY,
+            description=(
+                "Central settings object for one or more KASKI GPT Image "
+                "generator nodes. Fan this output out to every generator "
+                "that should share the same model configuration."
+            ),
             inputs=[
-                IO.String.Input(
-                    "prompt",
-                    default="",
-                    multiline=True,
-                    tooltip="Text prompt for GPT Image.",
-                ),
-                IO.Int.Input(
-                    "seed",
-                    default=0,
-                    min=0,
-                    max=2**31 - 1,
-                    step=1,
-                    display_mode=IO.NumberDisplay.number,
-                    control_after_generate=True,
-                    tooltip="Not implemented yet in backend.",
-                    optional=True,
-                ),
-                IO.String.Input(
-                    "quality",
-                    default="low",
-                    tooltip="Image quality: low, medium, high.",
-                    optional=True,
-                ),
-                IO.String.Input(
-                    "background",
-                    default="opaque",
-                    tooltip="Background mode: auto, opaque, transparent.",
-                    optional=True,
-                ),
-                IO.String.Input(
-                    "size",
-                    default="1024x1024",
-                    tooltip="Image size, e.g. auto, 1024x1024, 1536x1024, 2048x2048, 3840x2160.",
-                    optional=True,
+                IO.DynamicCombo.Input(
+                    "model",
+                    options=[
+                        IO.DynamicCombo.Option(
+                            "gpt-image-2",
+                            [
+                                IO.Combo.Input(
+                                    "size",
+                                    default="auto",
+                                    options=[
+                                        "auto",
+                                        "1024x1024",
+                                        "1024x1536",
+                                        "1536x1024",
+                                        "2048x2048",
+                                        "2048x1152",
+                                        "1152x2048",
+                                        "3840x2160",
+                                        "2160x3840",
+                                        "Custom",
+                                    ],
+                                    tooltip=(
+                                        "Image size. Select Custom to use "
+                                        "custom width and height."
+                                    ),
+                                ),
+                                IO.Int.Input(
+                                    "custom_width",
+                                    default=1024,
+                                    min=1024,
+                                    max=3840,
+                                    step=16,
+                                    tooltip=(
+                                        "Used only when size is Custom. "
+                                        "Must be a multiple of 16."
+                                    ),
+                                ),
+                                IO.Int.Input(
+                                    "custom_height",
+                                    default=1024,
+                                    min=1024,
+                                    max=3840,
+                                    step=16,
+                                    tooltip=(
+                                        "Used only when size is Custom. "
+                                        "Must be a multiple of 16."
+                                    ),
+                                ),
+                                IO.Combo.Input(
+                                    "background",
+                                    default="auto",
+                                    options=["auto", "opaque"],
+                                    tooltip=(
+                                        "GPT Image 2 does not support "
+                                        "transparent output."
+                                    ),
+                                ),
+                                IO.Combo.Input(
+                                    "quality",
+                                    default="low",
+                                    options=["low", "medium", "high"],
+                                    tooltip=(
+                                        "Image quality, affecting cost and "
+                                        "generation time."
+                                    ),
+                                ),
+                            ],
+                        ),
+                        IO.DynamicCombo.Option(
+                            "gpt-image-1.5",
+                            _settings_inputs_for_legacy_model(),
+                        ),
+                        IO.DynamicCombo.Option(
+                            "gpt-image-1",
+                            _settings_inputs_for_legacy_model(),
+                        ),
+                    ],
+                    tooltip="Model and model-specific image settings.",
                 ),
                 IO.Int.Input(
                     "n",
@@ -207,29 +496,118 @@ class OpenAIGPTImage1(IO.ComfyNode):
                     min=1,
                     max=8,
                     step=1,
-                    tooltip="How many images to generate.",
+                    tooltip="How many images to generate per request.",
                     display_mode=IO.NumberDisplay.number,
-                    optional=True,
-                ),
-                IO.Image.Input(
-                    "image",
-                    tooltip="Optional reference image for image editing.",
-                    optional=True,
-                ),
-                IO.Mask.Input(
-                    "mask",
-                    tooltip="Optional mask for inpainting. White areas will be replaced.",
-                    optional=True,
-                ),
-                IO.String.Input(
-                    "model",
-                    default="gpt-image-2",
-                    tooltip="Model: gpt-image-1, gpt-image-1.5, gpt-image-2.",
-                    optional=True,
                 ),
             ],
             outputs=[
-                IO.Image.Output(),
+                IO.Custom(SETTINGS_TYPE).Output(
+                    display_name="settings"
+                ),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model: dict[str, Any],
+        n: int,
+    ) -> IO.NodeOutput:
+        try:
+            model_id = model["model"]
+            is_gpt_image_2 = model_id == "gpt-image-2"
+
+            settings = {
+                "model_id": model_id,
+                "quality": model["quality"],
+                "background": model["background"],
+                "size": model["size"],
+                "custom_width": (
+                    int(model.get("custom_width", 1024))
+                    if is_gpt_image_2
+                    else None
+                ),
+                "custom_height": (
+                    int(model.get("custom_height", 1024))
+                    if is_gpt_image_2
+                    else None
+                ),
+                "n": int(n),
+            }
+
+            return IO.NodeOutput(_validate_settings(settings))
+        except Exception as error:
+            _log_soft_error("OpenAIGPTImageSettings.execute", error)
+            return IO.NodeOutput(_default_settings())
+
+
+class OpenAIGPTImage1(IO.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return IO.Schema(
+            # Keep the existing KASKI node ID to minimize workflow breakage.
+            node_id="OpenAIGPTImage1_KASKI",
+            display_name="OpenAI GPT Image IO-unlocked",
+            category=CATEGORY,
+            description=(
+                "Generate or edit images via OpenAI's GPT Image endpoint. "
+                "Shared model configuration is supplied by the OpenAI GPT "
+                "Image Settings node."
+            ),
+            inputs=[
+                IO.String.Input(
+                    "prompt",
+                    default="",
+                    multiline=True,
+                    tooltip="Text prompt for GPT Image.",
+                ),
+                IO.Custom(SETTINGS_TYPE).Input(
+                    "settings",
+                    tooltip=(
+                        "Connect one central OpenAI GPT Image Settings node. "
+                        "The same output can feed multiple generators."
+                    ),
+                ),
+                IO.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=2147483647,
+                    step=1,
+                    display_mode=IO.NumberDisplay.number,
+                    control_after_generate=True,
+                    tooltip=(
+                        "ComfyUI cache-buster and control-after-generate "
+                        "value. The current GPT Image request schema does "
+                        "not send it to OpenAI."
+                    ),
+                ),
+                IO.Autogrow.Input(
+                    "images",
+                    template=IO.Autogrow.TemplateNames(
+                        IO.Image.Input("image"),
+                        names=[
+                            f"image_{index}"
+                            for index in range(1, MAX_REFERENCE_IMAGES + 1)
+                        ],
+                        min=0,
+                    ),
+                    tooltip=(
+                        "Optional reference images for editing. Up to 16 "
+                        "individual images or batched IMAGE tensors."
+                    ),
+                ),
+                IO.Mask.Input(
+                    "mask",
+                    optional=True,
+                    tooltip=(
+                        "Optional inpainting mask. White areas are replaced. "
+                        "Requires exactly one reference image."
+                    ),
+                ),
+            ],
+            outputs=[
+                IO.Image.Output(display_name="image"),
             ],
             hidden=[
                 IO.Hidden.auth_token_comfy_org,
@@ -237,258 +615,167 @@ class OpenAIGPTImage1(IO.ComfyNode):
                 IO.Hidden.unique_id,
             ],
             is_api_node=True,
-            price_badge=IO.PriceBadge(
-                depends_on=IO.PriceBadgeDepends(widgets=["quality", "n", "model"]),
-                expr="""
-                (
-                  $ranges := {
-                    "gpt-image-1": {
-                      "low":    [0.011, 0.02],
-                      "medium": [0.042, 0.07],
-                      "high":   [0.167, 0.25]
-                    },
-                    "gpt-image-1.5": {
-                      "low":    [0.009, 0.02],
-                      "medium": [0.034, 0.062],
-                      "high":   [0.133, 0.22]
-                    },
-                    "gpt-image-2": {
-                      "low":    [0.0048, 0.012],
-                      "medium": [0.041, 0.112],
-                      "high":   [0.165, 0.43]
-                    }
-                  };
-                  $range := $lookup($lookup($ranges, widgets.model), widgets.quality);
-                  $nRaw := widgets.n;
-                  $n := ($nRaw != null and $nRaw != 0) ? $nRaw : 1;
-                  ($n = 1)
-                    ? {"type":"range_usd","min_usd": $range[0], "max_usd": $range[1], "format": {"approximate": true}}
-                    : {
-                        "type":"range_usd",
-                        "min_usd": $range[0] * $n,
-                        "max_usd": $range[1] * $n,
-                        "format": { "suffix": "/Run", "approximate": true }
-                      }
-                )
-                """,
-            ),
         )
 
     @classmethod
     async def execute(
         cls,
         prompt: str,
-        seed: int = 0,
-        quality: str = "low",
-        background: str = "opaque",
-        size: str = "1024x1024",
-        n: int = 1,
-        image: Input.Image | None = None,
+        settings: dict[str, Any],
+        seed: int,
+        images: (
+            Input.Image
+            | list[Input.Image]
+            | dict[str, Input.Image]
+            | None
+        ) = None,
         mask: Input.Image | None = None,
-        model: str = "gpt-image-2",
     ) -> IO.NodeOutput:
-        validate_string(prompt, strip_whitespace=True, min_length=1)
+        # Upstream currently exposes seed only as a ComfyUI cache-buster.
+        del seed
 
-        model = normalize_gpt_image_model(model)
-        quality = normalize_gpt_image_quality(quality)
-        background = normalize_gpt_image_background(background)
-        size = normalize_gpt_image_size(size)
+        try:
+            validate_string(prompt, strip_whitespace=False)
+            settings = _validate_settings(settings)
 
-        if mask is not None and image is None:
-            raise ValueError("Cannot use a mask without an input image")
+            model_id = settings["model_id"]
+            quality = settings["quality"]
+            background = settings["background"]
+            n = settings["n"]
+            size = _resolve_request_size(settings)
+            price_extractor = _price_extractor_for_model(model_id)
 
-        if model in ("gpt-image-1", "gpt-image-1.5"):
-            if size not in VALID_GPT_IMAGE_1_SIZES:
-                raise ValueError(f"Resolution '{size}' is only supported by GPT Image 2 model")
+            flat_images = _collect_image_tensors(images)
 
-        if model == "gpt-image-1":
-            price_extractor = calculate_tokens_price_image_1
-        elif model == "gpt-image-1.5":
-            price_extractor = calculate_tokens_price_image_1_5
-        elif model == "gpt-image-2":
-            price_extractor = calculate_tokens_price_image_2_0
-            if background == "transparent":
-                raise ValueError("Transparent background is not supported for GPT Image 2 model")
-        else:
-            raise ValueError(f"Unknown model: {model}")
+            if mask is not None and not flat_images:
+                raise ValueError("Cannot use a mask without an input image.")
 
-        if image is not None:
-            files = []
-            batch_size = image.shape[0]
+            if flat_images:
+                files = []
 
-            for i in range(batch_size):
-                single_image = image[i : i + 1]
-                scaled_image = downscale_image_tensor(
-                    single_image,
-                    total_pixels=2048 * 2048,
-                ).squeeze()
+                for index, single_image in enumerate(flat_images):
+                    scaled_image = downscale_image_tensor(
+                        single_image,
+                        total_pixels=2048 * 2048,
+                    ).squeeze()
 
-                image_np = (scaled_image.numpy() * 255).astype(np.uint8)
-                img = Image.fromarray(image_np)
+                    image_np = (
+                        scaled_image.numpy() * 255
+                    ).astype(np.uint8)
+                    pil_image = Image.fromarray(image_np)
 
-                img_byte_arr = BytesIO()
-                img.save(img_byte_arr, format="PNG")
-                img_byte_arr.seek(0)
+                    image_bytes = BytesIO()
+                    pil_image.save(image_bytes, format="PNG")
+                    image_bytes.seek(0)
 
-                if batch_size == 1:
-                    files.append(("image", (f"image_{i}.png", img_byte_arr, "image/png")))
-                else:
-                    files.append(("image[]", (f"image_{i}.png", img_byte_arr, "image/png")))
+                    field_name = (
+                        "image" if len(flat_images) == 1 else "image[]"
+                    )
+                    files.append(
+                        (
+                            field_name,
+                            (
+                                f"image_{index}.png",
+                                image_bytes,
+                                "image/png",
+                            ),
+                        )
+                    )
 
-            if mask is not None:
-                if image.shape[0] != 1:
-                    raise Exception("Cannot use a mask with multiple image")
+                if mask is not None:
+                    if len(flat_images) != 1:
+                        raise ValueError(
+                            "Cannot use a mask with multiple images."
+                        )
 
-                if mask.shape[1:] != image.shape[1:-1]:
-                    raise Exception("Mask and Image must be the same size")
+                    reference_image = flat_images[0]
+                    if mask.shape[1:] != reference_image.shape[1:-1]:
+                        raise ValueError(
+                            "Mask and image must have the same size."
+                        )
 
-                _, height, width = mask.shape
+                    _, height, width = mask.shape
+                    rgba_mask = torch.zeros(
+                        height,
+                        width,
+                        4,
+                        device="cpu",
+                    )
+                    rgba_mask[:, :, 3] = 1 - mask.squeeze().cpu()
 
-                rgba_mask = torch.zeros(height, width, 4, device="cpu")
-                rgba_mask[:, :, 3] = 1 - mask.squeeze().cpu()
+                    scaled_mask = downscale_image_tensor(
+                        rgba_mask.unsqueeze(0),
+                        total_pixels=2048 * 2048,
+                    ).squeeze()
 
-                scaled_mask = downscale_image_tensor(
-                    rgba_mask.unsqueeze(0),
-                    total_pixels=2048 * 2048,
-                ).squeeze()
+                    mask_np = (
+                        scaled_mask.numpy() * 255
+                    ).astype(np.uint8)
+                    mask_image = Image.fromarray(mask_np)
 
-                mask_np = (scaled_mask.numpy() * 255).astype(np.uint8)
-                mask_img = Image.fromarray(mask_np)
+                    mask_bytes = BytesIO()
+                    mask_image.save(mask_bytes, format="PNG")
+                    mask_bytes.seek(0)
 
-                mask_img_byte_arr = BytesIO()
-                mask_img.save(mask_img_byte_arr, format="PNG")
-                mask_img_byte_arr.seek(0)
+                    files.append(
+                        (
+                            "mask",
+                            ("mask.png", mask_bytes, "image/png"),
+                        )
+                    )
 
-                files.append(("mask", ("mask.png", mask_img_byte_arr, "image/png")))
+                response = await sync_op(
+                    cls,
+                    ApiEndpoint(
+                        path="/proxy/openai/images/edits",
+                        method="POST",
+                    ),
+                    response_model=OpenAIImageGenerationResponse,
+                    data=OpenAIImageEditRequest(
+                        model=model_id,
+                        prompt=prompt,
+                        quality=quality,
+                        background=background,
+                        n=n,
+                        size=size,
+                        moderation="low",
+                    ),
+                    content_type="multipart/form-data",
+                    files=files,
+                    price_extractor=price_extractor,
+                )
+            else:
+                response = await sync_op(
+                    cls,
+                    ApiEndpoint(
+                        path="/proxy/openai/images/generations",
+                        method="POST",
+                    ),
+                    response_model=OpenAIImageGenerationResponse,
+                    data=OpenAIImageGenerationRequest(
+                        model=model_id,
+                        prompt=prompt,
+                        quality=quality,
+                        background=background,
+                        n=n,
+                        size=size,
+                        moderation="low",
+                    ),
+                    price_extractor=price_extractor,
+                )
 
-            response = await sync_op(
-                cls,
-                ApiEndpoint(path="/proxy/openai/images/edits", method="POST"),
-                response_model=OpenAIImageGenerationResponse,
-                data=OpenAIImageEditRequest(
-                    model=model,
-                    prompt=prompt,
-                    quality=quality,
-                    background=background,
-                    n=n,
-                    seed=seed,
-                    size=size,
-                    moderation="low",
-                ),
-                content_type="multipart/form-data",
-                files=files,
-                price_extractor=price_extractor,
+            return IO.NodeOutput(
+                await validate_and_cast_response(response)
             )
-
-        else:
-            response = await sync_op(
-                cls,
-                ApiEndpoint(path="/proxy/openai/images/generations", method="POST"),
-                response_model=OpenAIImageGenerationResponse,
-                data=OpenAIImageGenerationRequest(
-                    model=model,
-                    prompt=prompt,
-                    quality=quality,
-                    background=background,
-                    n=n,
-                    seed=seed,
-                    size=size,
-                    moderation="low",
-                ),
-                price_extractor=price_extractor,
-            )
-
-        return IO.NodeOutput(await validate_and_cast_response(response))
-
-
-class OpenAIGPTImageSettings:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ([
-                    "gpt-image-1",
-                    "gpt-image-1.5",
-                    "gpt-image-2",
-                ], {
-                    "default": "gpt-image-2",
-                }),
-                "quality": ([
-                    "low",
-                    "medium",
-                    "high",
-                ], {
-                    "default": "low",
-                }),
-                "background": ([
-                    "auto",
-                    "opaque",
-                    "transparent",
-                ], {
-                    "default": "opaque",
-                }),
-                "size": ([
-                    "auto",
-                    "1024x1024",
-                    "1024x1536",
-                    "1536x1024",
-                    "2048x2048",
-                    "2048x1152",
-                    "1152x2048",
-                    "3840x2160",
-                    "2160x3840",
-                ], {
-                    "default": "1024x1024",
-                }),
-                "n": ("INT", {
-                    "default": 1,
-                    "min": 1,
-                    "max": 8,
-                    "step": 1,
-                    "display": "number",
-                }),
-            }
-        }
-
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "INT")
-    RETURN_NAMES = ("model", "quality", "background", "size", "n")
-    FUNCTION = "get_settings"
-    CATEGORY = "KASKI/api-adaptions/openai"
-
-    def get_settings(
-        self,
-        model: str,
-        quality: str,
-        background: str,
-        size: str,
-        n: int,
-    ):
-        model = normalize_gpt_image_model(model)
-        quality = normalize_gpt_image_quality(quality)
-        background = normalize_gpt_image_background(background)
-        size = normalize_gpt_image_size(size)
-
-        if not isinstance(n, int):
-            raise TypeError("n must be an integer")
-
-        if n < 1 or n > 8:
-            raise ValueError("n must be between 1 and 8")
-
-        if model in ("gpt-image-1", "gpt-image-1.5"):
-            if size not in VALID_GPT_IMAGE_1_SIZES:
-                raise ValueError(f"Resolution '{size}' is only supported by GPT Image 2 model")
-
-        if model == "gpt-image-2" and background == "transparent":
-            raise ValueError("Transparent background is not supported for GPT Image 2 model")
-
-        return (model, quality, background, size, n)
+        except Exception as error:
+            _log_soft_error("OpenAIGPTImage1.execute", error)
+            return IO.NodeOutput(_black_image())
 
 
 OPENAI_GPT_IMAGE_REWRITE_NODE_CLASS_MAPPINGS = {
     "OpenAIGPTImage1_KASKI": OpenAIGPTImage1,
     "OpenAIGPTImageSettings_KASKI": OpenAIGPTImageSettings,
 }
-
 
 OPENAI_GPT_IMAGE_REWRITE_NODE_DISPLAY_NAME_MAPPINGS = {
     "OpenAIGPTImage1_KASKI": "OpenAI GPT Image IO-unlocked",
