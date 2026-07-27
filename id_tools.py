@@ -101,7 +101,7 @@ class ExtractReferenceID:
 ### SHOT-ID-TOOLS
 
 REGEX_ID = re.compile(
-    r"(?:[A-Za-z0-9-]+_)?sh[0-9]+_(?:firstFrame|notEnhanced|enhanced|Depth|Normal|Scribble|lastFrame)_v(?:[0-9]+|N)"
+    r"(?:[A-Za-z0-9-]+_)?sh[0-9]+_(?:firstFrame|notEnhanced|enhanced|Depth|Normal|cgi|Scribble|lastFrame)_v(?:[0-9]+|N)"
 )
 
 
@@ -113,7 +113,7 @@ class GenerateShotID:
             "required": {
                 "project_name": ("STRING", {"default": "NONE", "multiline": False}),
                 "shot_no": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
-                "pipeline_step": (["firstFrame", "notEnhanced", "enhanced", "Depth", "Normal", "Scribble", "lastFrame"],),
+                "pipeline_step": (["firstFrame", "notEnhanced", "enhanced", "Depth", "Normal", "Scribble", "lastFrame", "cgi"],),
                 "version": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
                 "shot_no_zero_padding": ("INT", {"default": 3, "min": 0, "max": 15, "step": 1}),
             },
@@ -164,7 +164,7 @@ class ModifyShotID:
                 "idx": ("STRING", {"multiline": False}),
                 "project_name": ("STRING", {"default": "KEEP", "multiline": False}),
                 "shot_no": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
-                "pipeline_step": (["KEEP", "firstFrame", "notEnhanced", "enhanced", "Depth", "Normal", "Scribble", "lastFrame"],),
+                "pipeline_step": (["KEEP", "firstFrame", "notEnhanced", "enhanced", "Depth", "Normal", "Scribble", "lastFrame", "cgi"],),
                 "version": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
                 "shot_no_zero_padding": ("INT", {"default": 3, "min": 0, "max": 15, "step": 1}),
             },
