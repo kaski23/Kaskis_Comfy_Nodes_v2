@@ -1,5 +1,5 @@
 from .loaders import *
-from .input_conformer import *
+from .input_conform import IOCONFORMER_NODE_CLASS_MAPPINGS, IOCONFORMER_NODE_DISPLAY_NAME_MAPPINGS
 from .string_tools import STRING_TOOLS_NODE_CLASS_MAPPINGS, STRING_TOOLS_NODE_DISPLAY_NAME_MAPPINGS
 from .id_tools import ID_TOOLS_NODE_CLASS_MAPPINGS, ID_TOOLS_NODE_DISPLAY_NAME_MAPPINGS
 from .async_tools import *
@@ -12,9 +12,7 @@ NODE_CLASS_MAPPINGS = {
     **ID_TOOLS_NODE_CLASS_MAPPINGS,
     **NANOBANANA_REWRITE_NODE_CLASS_MAPPINGS,
     **OPENAI_GPT_IMAGE_REWRITE_NODE_CLASS_MAPPINGS,
-    
-    "VideoSizeLengthConformer_KASKI": VideoSizeLengthConformer,
-    "WanVaceInputConform_KASKI": WanVaceInputConform,
+    **IOCONFORMER_NODE_CLASS_MAPPINGS,
     
     "LoadVideoWithFilename_KASKI": LoadVideoWithFilename,
     "LoadImageWithFilename_KASKI": LoadImageWithFilename,
@@ -29,9 +27,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     **ID_TOOLS_NODE_DISPLAY_NAME_MAPPINGS,
     **NANOBANANA_REWRITE_NODE_DISPLAY_NAME_MAPPINGS,
     **OPENAI_GPT_IMAGE_REWRITE_NODE_DISPLAY_NAME_MAPPINGS,
-    
-    "VideoSizeLengthConformer_KASKI": "Conform Video Size and Length",
-    "WanVaceInputConform_KASKI": "Conform Video for Wan 2.1",
+    **IOCONFORMER_NODE_DISPLAY_NAME_MAPPINGS,
     
     "LoadVideoWithFilename_KASKI": "Load Video with Filename",
     "LoadImageWithFilename_KASKI": "Load Image with Filename",
