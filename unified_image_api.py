@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+from pydantic import BaseModel
 from PIL import Image
 
 from comfy.utils import common_upscale
@@ -16,6 +17,20 @@ from comfy_api_nodes.apis.openai import (
     OpenAIImageEditRequest,
     OpenAIImageGenerationRequest,
     OpenAIImageGenerationResponse,
+)
+from comfy_api_nodes.apis.bytedance import (
+    RECOMMENDED_PRESETS_SEEDREAM_5_LITE,
+    RECOMMENDED_PRESETS_SEEDREAM_5_PRO,
+    ImageTaskCreationResponse,
+    Seedream4Options,
+    Seedream4TaskCreationRequest,
+    Seedream5OptimizePromptOptions,
+)
+from comfy_api_nodes.apis.bfl import (
+    BFLFluxProGenerateResponse,
+    BFLFluxStatusResponse,
+    BFLStatus,
+    Flux2ProGenerateRequest,
 )
 from comfy_api_nodes.apis.gemini import (
     GeminiContent,
@@ -39,9 +54,11 @@ from comfy_api_nodes.util import (
     download_url_to_bytesio,
     download_url_to_image_tensor,
     get_number_of_images,
+    poll_op,
     sync_op,
     tensor_to_base64_string,
     upload_images_to_comfyapi,
+    validate_image_aspect_ratio,
     validate_string,
 )
 
@@ -51,14 +68,36 @@ SETTINGS_TYPE = "KASKI_IMAGE_API_SETTINGS"
 
 PROVIDER_OPENAI = "openai"
 PROVIDER_GEMINI = "gemini"
+PROVIDER_SEEDREAM = "seedream"
+PROVIDER_FLUX2 = "flux2"
 
 OPENAI_PROVIDER_LABEL = "OpenAI GPT Image"
 GEMINI_PROVIDER_LABEL = "Gemini / Nanobanana"
+SEEDREAM_PROVIDER_LABEL = "ByteDance Seedream"
+FLUX2_PROVIDER_LABEL = "Black Forest Labs FLUX.2"
 
 MAX_OPENAI_REFERENCE_IMAGES = 16
 MAX_GEMINI_REFERENCE_IMAGES = 14
+MAX_SEEDREAM_PRO_REFERENCE_IMAGES = 10
+MAX_SEEDREAM_LITE_REFERENCE_IMAGES = 14
+MAX_FLUX2_REFERENCE_IMAGES = 8
 GEMINI_URL_IMAGE_BUDGET = 10
 GEMINI_BASE_ENDPOINT = "/proxy/vertexai/gemini"
+BYTEPLUS_IMAGE_ENDPOINT = "/proxy/byteplus/api/v3/images/generations"
+
+SEEDREAM_MODEL_IDS = {
+    "seedream 5.0 pro": "seedream-5-0-pro-260628",
+    "seedream 5.0 lite": "seedream-5-0-260128",
+}
+SEEDREAM_PRESETS = {
+    "seedream-5-0-pro-260628": RECOMMENDED_PRESETS_SEEDREAM_5_PRO,
+    "seedream-5-0-260128": RECOMMENDED_PRESETS_SEEDREAM_5_LITE,
+}
+
+FLUX2_MODEL_ENDPOINTS = {
+    "Flux.2 [pro]": "/proxy/bfl/flux-2-pro/generate",
+    "Flux.2 [max]": "/proxy/bfl/flux-2-max/generate",
+}
 
 
 # -----------------------------------------------------------------------------
@@ -758,6 +797,140 @@ def _validate_gemini_settings(settings: dict[str, Any]) -> dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Seedream helpers
+# -----------------------------------------------------------------------------
+
+
+def _seedream_get_image_url_from_response(response: ImageTaskCreationResponse) -> str:
+    if response.error:
+        error_msg = (
+            f"ByteDance request failed. Code: {response.error['code']}, "
+            f"message: {response.error['message']}"
+        )
+        raise RuntimeError(error_msg)
+    return response.data[0]["url"]
+
+
+def _validate_seedream_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    required_keys = {
+        "provider",
+        "model_label",
+        "model_id",
+        "size_preset",
+        "width",
+        "height",
+        "max_images",
+        "watermark",
+        "thinking",
+        "fail_on_partial",
+        "system_prompt",
+    }
+    missing_keys = required_keys.difference(settings)
+    if missing_keys:
+        raise ValueError(
+            "Seedream settings are incomplete. Missing: "
+            + ", ".join(sorted(missing_keys))
+        )
+
+    if settings["provider"] != PROVIDER_SEEDREAM:
+        raise ValueError(
+            f"Seedream adapter received provider '{settings['provider']}'."
+        )
+
+    model_label = settings["model_label"]
+    model_id = settings["model_id"]
+    if model_label not in SEEDREAM_MODEL_IDS:
+        raise ValueError(f"Invalid Seedream model label '{model_label}'.")
+    if model_id != SEEDREAM_MODEL_IDS[model_label]:
+        raise ValueError("Seedream model label and model ID do not match.")
+
+    presets = SEEDREAM_PRESETS[model_id]
+    valid_presets = {label for label, _, _ in presets}
+    if settings["size_preset"] not in valid_presets:
+        raise ValueError(
+            f"Invalid Seedream size preset '{settings['size_preset']}'."
+        )
+
+    width = settings["width"]
+    height = settings["height"]
+    if type(width) is not int or type(height) is not int:
+        raise TypeError("Seedream width and height must be integers.")
+
+    is_pro = model_id == "seedream-5-0-pro-260628"
+    max_width = 3136 if is_pro else 6240
+    max_height = 2496 if is_pro else 4992
+    if not 1024 <= width <= max_width:
+        raise ValueError(f"Seedream width must be between 1024 and {max_width}.")
+    if not 1024 <= height <= max_height:
+        raise ValueError(f"Seedream height must be between 1024 and {max_height}.")
+    if width % 2 or height % 2:
+        raise ValueError("Seedream width and height must be divisible by 2.")
+
+    max_images = settings["max_images"]
+    if type(max_images) is not int or not 1 <= max_images <= 14:
+        raise ValueError("Seedream max_images must be an integer between 1 and 14.")
+    if is_pro and max_images != 1:
+        raise ValueError("Seedream 5.0 Pro currently generates exactly one image per request.")
+
+    if not isinstance(settings["watermark"], bool):
+        raise TypeError("Seedream watermark must be a boolean.")
+    if not isinstance(settings["thinking"], bool):
+        raise TypeError("Seedream thinking must be a boolean.")
+    if not isinstance(settings["fail_on_partial"], bool):
+        raise TypeError("Seedream fail_on_partial must be a boolean.")
+    if not isinstance(settings["system_prompt"], str):
+        raise TypeError("system_prompt must be a string.")
+
+    return dict(settings)
+
+
+# -----------------------------------------------------------------------------
+# FLUX.2 helpers
+# -----------------------------------------------------------------------------
+
+
+def _validate_flux2_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    required_keys = {
+        "provider",
+        "model_label",
+        "endpoint",
+        "width",
+        "height",
+        "system_prompt",
+    }
+    missing_keys = required_keys.difference(settings)
+    if missing_keys:
+        raise ValueError(
+            "FLUX.2 settings are incomplete. Missing: "
+            + ", ".join(sorted(missing_keys))
+        )
+
+    if settings["provider"] != PROVIDER_FLUX2:
+        raise ValueError(
+            f"FLUX.2 adapter received provider '{settings['provider']}'."
+        )
+
+    model_label = settings["model_label"]
+    if model_label not in FLUX2_MODEL_ENDPOINTS:
+        raise ValueError(f"Invalid FLUX.2 model label '{model_label}'.")
+    if settings["endpoint"] != FLUX2_MODEL_ENDPOINTS[model_label]:
+        raise ValueError("FLUX.2 model label and endpoint do not match.")
+
+    width = settings["width"]
+    height = settings["height"]
+    if type(width) is not int or type(height) is not int:
+        raise TypeError("FLUX.2 width and height must be integers.")
+    if not 256 <= width <= 2048 or width % 32:
+        raise ValueError("FLUX.2 width must be 256..2048 in steps of 32.")
+    if not 256 <= height <= 2048 or height % 32:
+        raise ValueError("FLUX.2 height must be 256..2048 in steps of 32.")
+    if not isinstance(settings["system_prompt"], str):
+        raise TypeError("system_prompt must be a string.")
+
+    return dict(settings)
+
+
+# -----------------------------------------------------------------------------
 # Unified settings validation / defaults
 # -----------------------------------------------------------------------------
 
@@ -773,10 +946,14 @@ def _validate_settings(settings: Any) -> dict[str, Any]:
         return _validate_openai_settings(settings)
     if provider == PROVIDER_GEMINI:
         return _validate_gemini_settings(settings)
+    if provider == PROVIDER_SEEDREAM:
+        return _validate_seedream_settings(settings)
+    if provider == PROVIDER_FLUX2:
+        return _validate_flux2_settings(settings)
 
     raise ValueError(
-        f"Unknown image provider '{provider}'. Expected '{PROVIDER_OPENAI}' "
-        f"or '{PROVIDER_GEMINI}'."
+        f"Unknown image provider '{provider}'. Expected one of: "
+        f"{PROVIDER_OPENAI}, {PROVIDER_GEMINI}, {PROVIDER_SEEDREAM}, {PROVIDER_FLUX2}."
     )
 
 
@@ -982,6 +1159,121 @@ def _gemini_model_selector() -> Input:
     )
 
 
+def _seedream_model_inputs(
+    *,
+    presets: list,
+    max_width: int,
+    max_height: int,
+    supports_batch: bool,
+) -> list[Input]:
+    inputs: list[Input] = [
+        IO.Combo.Input(
+            "size_preset",
+            options=[label for label, _, _ in presets],
+            tooltip="Pick a recommended size. Select Custom to use width and height.",
+        ),
+        IO.Int.Input(
+            "width",
+            default=2048,
+            min=1024,
+            max=max_width,
+            step=2,
+            tooltip="Custom width; used only when size_preset is Custom.",
+        ),
+        IO.Int.Input(
+            "height",
+            default=2048,
+            min=1024,
+            max=max_height,
+            step=2,
+            tooltip="Custom height; used only when size_preset is Custom.",
+        ),
+    ]
+    if supports_batch:
+        inputs.extend(
+            [
+                IO.Int.Input(
+                    "max_images",
+                    default=1,
+                    min=1,
+                    max=14,
+                    step=1,
+                    display_mode=IO.NumberDisplay.number,
+                    tooltip=(
+                        "Maximum number of related images to generate. "
+                        "Input references plus generated images cannot exceed 15."
+                    ),
+                ),
+                IO.Boolean.Input(
+                    "fail_on_partial",
+                    default=False,
+                    tooltip=(
+                        "Abort if any requested images are missing or return an error."
+                    ),
+                    advanced=True,
+                ),
+            ]
+        )
+    return inputs
+
+
+def _seedream_model_selector() -> Input:
+    return IO.DynamicCombo.Input(
+        "model_settings",
+        options=[
+            IO.DynamicCombo.Option(
+                "seedream 5.0 pro",
+                _seedream_model_inputs(
+                    presets=RECOMMENDED_PRESETS_SEEDREAM_5_PRO,
+                    max_width=3136,
+                    max_height=2496,
+                    supports_batch=False,
+                ),
+            ),
+            IO.DynamicCombo.Option(
+                "seedream 5.0 lite",
+                _seedream_model_inputs(
+                    presets=RECOMMENDED_PRESETS_SEEDREAM_5_LITE,
+                    max_width=6240,
+                    max_height=4992,
+                    supports_batch=True,
+                ),
+            ),
+        ],
+        tooltip="Seedream model and model-specific output settings.",
+    )
+
+
+def _flux2_model_inputs() -> list[Input]:
+    return [
+        IO.Int.Input(
+            "width",
+            default=1024,
+            min=256,
+            max=2048,
+            step=32,
+        ),
+        IO.Int.Input(
+            "height",
+            default=768,
+            min=256,
+            max=2048,
+            step=32,
+        ),
+    ]
+
+
+def _flux2_model_selector() -> Input:
+    return IO.DynamicCombo.Input(
+        "model_settings",
+        options=[
+            IO.DynamicCombo.Option("Flux.2 [pro]", _flux2_model_inputs()),
+            IO.DynamicCombo.Option("Flux.2 [max]", _flux2_model_inputs()),
+        ],
+        tooltip="FLUX.2 model and output resolution.",
+    )
+
+
 # -----------------------------------------------------------------------------
 # Unified settings node
 # -----------------------------------------------------------------------------
@@ -995,10 +1287,10 @@ class KASKIImageAPISettings(IO.ComfyNode):
             display_name="KASKI Image API Settings",
             category=CATEGORY,
             description=(
-                "One shared settings node for OpenAI GPT Image and Gemini / "
-                "Nanobanana. Choose the provider and model here, then fan this "
-                "settings output out to one or more KASKI Image API Generator "
-                "nodes."
+                "One shared settings node for OpenAI GPT Image, Gemini / "
+                "Nanobanana, ByteDance Seedream, and Black Forest Labs FLUX.2. "
+                "Choose the provider and model here, then fan this settings output "
+                "out to one or more KASKI Image API Generator nodes."
             ),
             inputs=[
                 IO.DynamicCombo.Input(
@@ -1014,10 +1306,7 @@ class KASKIImageAPISettings(IO.ComfyNode):
                                     min=1,
                                     max=8,
                                     step=1,
-                                    tooltip=(
-                                        "How many images OpenAI should generate "
-                                        "per request."
-                                    ),
+                                    tooltip="How many images OpenAI should generate per request.",
                                     display_mode=IO.NumberDisplay.number,
                                 ),
                             ],
@@ -1031,9 +1320,8 @@ class KASKIImageAPISettings(IO.ComfyNode):
                                     options=["IMAGE", "IMAGE+TEXT"],
                                     default="IMAGE",
                                     tooltip=(
-                                        "IMAGE returns only generated images. "
-                                        "IMAGE+TEXT also returns the model's "
-                                        "text response."
+                                        "IMAGE returns only generated images. IMAGE+TEXT also "
+                                        "returns the model's text response."
                                     ),
                                 ),
                                 IO.Float.Input(
@@ -1043,8 +1331,8 @@ class KASKIImageAPISettings(IO.ComfyNode):
                                     max=2.0,
                                     step=0.01,
                                     tooltip=(
-                                        "Controls generation randomness. Lower "
-                                        "is more focused; higher is more variable."
+                                        "Controls generation randomness. Lower is more focused; "
+                                        "higher is more variable."
                                     ),
                                     advanced=True,
                                 ),
@@ -1059,10 +1347,37 @@ class KASKIImageAPISettings(IO.ComfyNode):
                                 ),
                             ],
                         ),
+                        IO.DynamicCombo.Option(
+                            SEEDREAM_PROVIDER_LABEL,
+                            [
+                                _seedream_model_selector(),
+                                IO.Boolean.Input(
+                                    "watermark",
+                                    default=False,
+                                    tooltip='Whether to add an "AI generated" watermark.',
+                                    advanced=True,
+                                ),
+                                IO.Boolean.Input(
+                                    "thinking",
+                                    default=True,
+                                    tooltip=(
+                                        "Enable Seedream prompt-optimization reasoning. "
+                                        "Can only be disabled for text-to-image."
+                                    ),
+                                    advanced=True,
+                                ),
+                            ],
+                        ),
+                        IO.DynamicCombo.Option(
+                            FLUX2_PROVIDER_LABEL,
+                            [
+                                _flux2_model_selector(),
+                            ],
+                        ),
                     ],
                     tooltip=(
-                        "Select the image API backend. Only settings relevant "
-                        "to that backend are shown."
+                        "Select the image API backend. Only settings relevant to that "
+                        "backend are shown."
                     ),
                 ),
                 IO.String.Input(
@@ -1071,8 +1386,8 @@ class KASKIImageAPISettings(IO.ComfyNode):
                     default=GEMINI_IMAGE_SYS_PROMPT,
                     tooltip=(
                         "Shared system prompt. Gemini sends it as systemInstruction. "
-                        "OpenAI keeps it in the shared settings object but does "
-                        "not send it to the GPT Image endpoint."
+                        "OpenAI, Seedream, and FLUX.2 retain it in the shared settings "
+                        "object but do not forward it to their current API requests."
                     ),
                     advanced=True,
                 ),
@@ -1133,6 +1448,41 @@ class KASKIImageAPISettings(IO.ComfyNode):
                     "thinking_level": model_settings.get("thinking_level"),
                     "temperature": float(backend["temperature"]),
                     "top_p": float(backend["top_p"]),
+                    "system_prompt": system_prompt,
+                }
+                return IO.NodeOutput(_validate_settings(settings))
+
+            if provider_label == SEEDREAM_PROVIDER_LABEL:
+                model_label = model_settings["model_settings"]
+                model_id = SEEDREAM_MODEL_IDS[model_label]
+                is_pro = model_id == "seedream-5-0-pro-260628"
+
+                settings = {
+                    "provider": PROVIDER_SEEDREAM,
+                    "model_label": model_label,
+                    "model_id": model_id,
+                    "size_preset": model_settings["size_preset"],
+                    "width": int(model_settings["width"]),
+                    "height": int(model_settings["height"]),
+                    "max_images": 1 if is_pro else int(model_settings.get("max_images", 1)),
+                    "watermark": bool(backend["watermark"]),
+                    "thinking": bool(backend["thinking"]),
+                    "fail_on_partial": False if is_pro else bool(model_settings.get("fail_on_partial", False)),
+                    # Retained in the universal settings payload; Seedream has no
+                    # system-instruction field in the current Comfy partner request.
+                    "system_prompt": system_prompt,
+                }
+                return IO.NodeOutput(_validate_settings(settings))
+
+            if provider_label == FLUX2_PROVIDER_LABEL:
+                model_label = model_settings["model_settings"]
+                settings = {
+                    "provider": PROVIDER_FLUX2,
+                    "model_label": model_label,
+                    "endpoint": FLUX2_MODEL_ENDPOINTS[model_label],
+                    "width": int(model_settings["width"]),
+                    "height": int(model_settings["height"]),
+                    # Retained but not forwarded to BFL.
                     "system_prompt": system_prompt,
                 }
                 return IO.NodeOutput(_validate_settings(settings))
@@ -1396,6 +1746,205 @@ async def _execute_gemini(
     )
 
 
+async def _execute_seedream(
+    cls: type[IO.ComfyNode],
+    *,
+    prompt: str,
+    settings: dict[str, Any],
+    seed: int,
+    images: Input.Image | None,
+) -> tuple[torch.Tensor, str, torch.Tensor]:
+    validate_string(prompt, strip_whitespace=True, min_length=1)
+    settings = _validate_seedream_settings(settings)
+
+    # The unified generator keeps its existing wide seed range for workflow
+    # compatibility. Seedream's partner API accepts signed 31-bit seeds, so map
+    # deterministically into that range before forwarding.
+    seed = seed & 0x7FFFFFFF
+
+    model_id = settings["model_id"]
+    presets = SEEDREAM_PRESETS[model_id]
+    is_pro = model_id == "seedream-5-0-pro-260628"
+
+    w = h = None
+    for label, preset_w, preset_h in presets:
+        if label == settings["size_preset"]:
+            w, h = preset_w, preset_h
+            break
+    if w is None or h is None:
+        w, h = settings["width"], settings["height"]
+
+    out_num_pixels = w * h
+    mp_provided = out_num_pixels / 1_000_000.0
+    if is_pro:
+        if out_num_pixels < 921_600:
+            raise ValueError(
+                f"Minimum image resolution for Seedream 5.0 Pro is 0.92MP, "
+                f"but {mp_provided:.2f}MP provided."
+            )
+        if out_num_pixels > 4_194_304:
+            raise ValueError(
+                f"Maximum image resolution for Seedream 5.0 Pro is 4.19MP, "
+                f"but {mp_provided:.2f}MP provided."
+            )
+    else:
+        if out_num_pixels < 3_686_400:
+            raise ValueError(
+                f"Minimum image resolution for Seedream 5.0 Lite is 3.68MP, "
+                f"but {mp_provided:.2f}MP provided."
+            )
+        if out_num_pixels > 16_777_216:
+            raise ValueError(
+                f"Maximum image resolution for Seedream 5.0 Lite is 16.78MP, "
+                f"but {mp_provided:.2f}MP provided."
+            )
+
+    n_input_images = get_number_of_images(images) if images is not None else 0
+    max_refs = (
+        MAX_SEEDREAM_PRO_REFERENCE_IMAGES
+        if is_pro
+        else MAX_SEEDREAM_LITE_REFERENCE_IMAGES
+    )
+    if n_input_images > max_refs:
+        raise ValueError(
+            f"Seedream {settings['model_label']} supports at most {max_refs} "
+            f"reference images; received {n_input_images}."
+        )
+
+    max_images = settings["max_images"]
+    sequential_image_generation = "disabled" if max_images == 1 else "auto"
+    if sequential_image_generation == "auto" and n_input_images + max_images > 15:
+        raise ValueError(
+            "Seedream reference images plus generated images cannot exceed 15."
+        )
+    if not settings["thinking"] and n_input_images > 0:
+        raise ValueError(
+            "Seedream 'thinking' can only be disabled for text-to-image."
+        )
+
+    reference_images_urls: list[str] = []
+    if images is not None and n_input_images > 0:
+        for image in images:
+            validate_image_aspect_ratio(image, (1, 3), (3, 1))
+        reference_images_urls = await upload_images_to_comfyapi(
+            cls,
+            images,
+            max_images=n_input_images,
+            mime_type="image/png",
+            wait_label="Uploading reference images",
+        )
+
+    optimize_prompt_options = None
+    if n_input_images == 0:
+        optimize_prompt_options = Seedream5OptimizePromptOptions(
+            thinking="enabled" if settings["thinking"] else "disabled"
+        )
+
+    response = await sync_op(
+        cls,
+        ApiEndpoint(path=BYTEPLUS_IMAGE_ENDPOINT, method="POST"),
+        response_model=ImageTaskCreationResponse,
+        data=Seedream4TaskCreationRequest(
+            model=model_id,
+            prompt=prompt,
+            image=reference_images_urls,
+            size=f"{w}x{h}",
+            seed=seed,
+            sequential_image_generation=(None if is_pro else sequential_image_generation),
+            sequential_image_generation_options=(
+                None if is_pro else Seedream4Options(max_images=max_images)
+            ),
+            watermark=settings["watermark"],
+            optimize_prompt_options=optimize_prompt_options,
+        ),
+    )
+
+    if len(response.data) == 1:
+        image = await download_url_to_image_tensor(
+            _seedream_get_image_url_from_response(response)
+        )
+        return image, "", _black_like(image)
+
+    urls = [
+        str(item["url"])
+        for item in response.data
+        if isinstance(item, dict) and "url" in item
+    ]
+    if settings["fail_on_partial"] and len(urls) < len(response.data):
+        raise RuntimeError(
+            f"Only {len(urls)} of {len(response.data)} images were generated before error."
+        )
+    if not urls:
+        raise RuntimeError("Seedream returned no usable image URLs.")
+
+    image = torch.cat([await download_url_to_image_tensor(url) for url in urls])
+    return image, "", _black_like(image)
+
+
+async def _execute_flux2(
+    cls: type[IO.ComfyNode],
+    *,
+    prompt: str,
+    settings: dict[str, Any],
+    seed: int,
+    images: Input.Image | None,
+) -> tuple[torch.Tensor, str, torch.Tensor]:
+    settings = _validate_flux2_settings(settings)
+
+    flux_seed = int(seed) & 0x7FFFFFFF
+
+    flat_images = _collect_image_tensors(images)
+    if len(flat_images) > MAX_FLUX2_REFERENCE_IMAGES:
+        raise ValueError(
+            f"FLUX.2 supports at most {MAX_FLUX2_REFERENCE_IMAGES} reference "
+            f"images; received {len(flat_images)}."
+        )
+
+    reference_images: dict[str, str] = {}
+    for idx, tensor in enumerate(flat_images):
+        key_name = f"input_image_{idx + 1}" if idx else "input_image"
+        reference_images[key_name] = tensor_to_base64_string(
+            tensor.squeeze(0),
+            total_pixels=2048 * 2048,
+        )
+
+    initial_response = await sync_op(
+        cls,
+        ApiEndpoint(path=settings["endpoint"], method="POST"),
+        response_model=BFLFluxProGenerateResponse,
+        data=Flux2ProGenerateRequest(
+            prompt=prompt,
+            width=settings["width"],
+            height=settings["height"],
+            seed=flux_seed,
+            **reference_images,
+        ),
+    )
+
+    def price_extractor(_response: BaseModel) -> float | None:
+        return None if initial_response.cost is None else initial_response.cost / 100
+
+    response = await poll_op(
+        cls,
+        ApiEndpoint(initial_response.polling_url),
+        response_model=BFLFluxStatusResponse,
+        status_extractor=lambda r: r.status,
+        progress_extractor=lambda r: r.progress,
+        price_extractor=price_extractor,
+        completed_statuses=[BFLStatus.ready],
+        failed_statuses=[
+            BFLStatus.request_moderated,
+            BFLStatus.content_moderated,
+            BFLStatus.error,
+            BFLStatus.task_not_found,
+        ],
+        queued_statuses=[],
+    )
+
+    image = await download_url_to_image_tensor(response.result["sample"])
+    return image, "", _black_like(image)
+
+
 # -----------------------------------------------------------------------------
 # Unified generator node
 # -----------------------------------------------------------------------------
@@ -1410,8 +1959,8 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
             category=CATEGORY,
             description=(
                 "Unified image generator. The connected KASKI Image API Settings "
-                "node decides whether this request is sent through OpenAI GPT "
-                "Image or Gemini / Nanobanana."
+                "node dispatches the request to OpenAI GPT Image, Gemini / "
+                "Nanobanana, ByteDance Seedream, or Black Forest Labs FLUX.2."
             ),
             inputs=[
                 IO.String.Input(
@@ -1436,9 +1985,9 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
                     control_after_generate=True,
                     display_mode=IO.NumberDisplay.number,
                     tooltip=(
-                        "ComfyUI cache-buster / control-after-generate value. "
-                        "It is not sent to either image API by the current "
-                        "request schemas."
+                        "Shared seed. FLUX.2 receives it directly; Seedream maps "
+                        "it deterministically into its 31-bit seed range. GPT Image "
+                        "and Gemini currently use it only as a ComfyUI cache-buster."
                     ),
                 ),
                 IO.Image.Input(
@@ -1448,16 +1997,16 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
                         "Optional reference images via exactly one IMAGE socket. "
                         "Pass a single image or a batched tensor shaped "
                         "(B, H, W, C). Each batch entry is sent as its own "
-                        "reference image. OpenAI supports up to 16 references; "
-                        "Gemini currently supports up to 14."
+                        "reference image. Limits: OpenAI 16, Gemini 14, "
+                        "Seedream Pro 10 / Lite 14, FLUX.2 8."
                     ),
                 ),
                 IO.Mask.Input(
                     "mask",
                     optional=True,
                     tooltip=(
-                        "Optional OpenAI inpainting mask. Ignored when the "
-                        "selected backend is Gemini. White areas are replaced; "
+                        "Optional OpenAI inpainting mask. Ignored by Gemini, "
+                        "Seedream, and FLUX.2. White areas are replaced; "
                         "requires exactly one OpenAI reference image."
                     ),
                 ),
@@ -1466,7 +2015,7 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
                     optional=True,
                     tooltip=(
                         "Optional Gemini input files from a compatible file node. "
-                        "Ignored when the selected backend is OpenAI."
+                        "Ignored by OpenAI, Seedream, and FLUX.2."
                     ),
                 ),
             ],
@@ -1476,8 +2025,8 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
                 IO.Image.Output(
                     display_name="thought_image",
                     tooltip=(
-                        "Gemini thinking-process image when available. OpenAI "
-                        "returns a black placeholder on this output."
+                        "Gemini thinking-process image when available. Other "
+                        "providers return a black placeholder on this output."
                     ),
                 ),
             ],
@@ -1499,9 +2048,8 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
         mask: Input.Image | None = None,
         files: list[GeminiPart] | None = None,
     ) -> IO.NodeOutput:
-        # Both upstream rewrites use seed only to invalidate ComfyUI's cache.
-        del seed
-
+        # GPT Image and Gemini currently use seed only as a cache-buster.
+        # Seedream and FLUX.2 receive the same shared value as their API seed.
         try:
             settings = _validate_settings(settings)
             provider = settings["provider"]
@@ -1523,6 +2071,26 @@ class KASKIImageAPIGenerator(IO.ComfyNode):
                     settings=settings,
                     images=images,
                     files=files,
+                )
+                return IO.NodeOutput(image, text, thought_image)
+
+            if provider == PROVIDER_SEEDREAM:
+                image, text, thought_image = await _execute_seedream(
+                    cls,
+                    prompt=prompt,
+                    settings=settings,
+                    seed=seed,
+                    images=images,
+                )
+                return IO.NodeOutput(image, text, thought_image)
+
+            if provider == PROVIDER_FLUX2:
+                image, text, thought_image = await _execute_flux2(
+                    cls,
+                    prompt=prompt,
+                    settings=settings,
+                    seed=seed,
+                    images=images,
                 )
                 return IO.NodeOutput(image, text, thought_image)
 
