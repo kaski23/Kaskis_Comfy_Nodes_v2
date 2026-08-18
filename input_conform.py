@@ -712,13 +712,8 @@ class AlignFramesToSeconds(ComfyNodeABC):
     """
     Aligns a frame count to the next full second at a given frame rate.
 
-    If the input frame count already represents an exact number of
-    seconds, it is returned unchanged.
-
-    Example at 24 fps:
-        233 frames -> 240 frames -> 10 seconds
-        240 frames -> 240 frames -> 10 seconds
-        241 frames -> 264 frames -> 11 seconds
+    If the input frame count already fits within an exact whole-second
+    duration, that duration is preserved.
     """
 
     @classmethod
@@ -727,23 +722,36 @@ class AlignFramesToSeconds(ComfyNodeABC):
             "required": {
                 "n_frames": (
                     "INT",
-                    {"default": 25, "min": 1, "max": 999999, "tooltip": "Number of frames in the source sequence."},
+                    {
+                        "default": 25,
+                        "min": 1,
+                        "max": 999999,
+                        "tooltip": "Number of frames in the source sequence.",
+                    },
                 ),
                 "fps": (
-                    "INT",
-                    {"default": 24, "min": 1, "max": 240, "tooltip": "Frame rate used to align the sequence length to a whole number of seconds."},
+                    "FLOAT",
+                    {
+                        "default": 24.0,
+                        "min": 1.0,
+                        "max": 240.0,
+                        "tooltip": "Frame rate used to align the sequence length to a whole number of seconds.",
+                    },
                 ),
             }
         }
 
-    RETURN_TYPES = ("INT", "INT")
+    RETURN_TYPES = ("INT", "INT", "FLOAT")
     RETURN_NAMES = (
         "frames_to_lengthen_to",
         "length_in_seconds",
+        "fps",
     )
+
     OUTPUT_TOOLTIPS = (
-        "Smallest frame count greater than or equal to the input length that represents a whole number of seconds.",
-        "Resulting duration in whole seconds.",
+        "Smallest frame count that covers the calculated whole-second duration.",
+        "Smallest whole-second duration that can contain the source sequence.",
+        "Pass-through of the fps used.",
     )
 
     FUNCTION = "align"
@@ -752,26 +760,26 @@ class AlignFramesToSeconds(ComfyNodeABC):
     def align(
         self,
         n_frames: int,
-        fps: int,
+        fps: float,
     ):
         """
         Calculates the smallest whole-second duration that can contain
-        the given number of frames, then converts it back to a frame count.
+        the given number of frames, then calculates the minimum number
+        of frames required to cover that duration.
         """
 
-        # Integer ceiling division:
-        # equivalent to math.ceil(n_frames / fps), but stays integer-only.
-        length_in_seconds = (
-            n_frames + fps - 1
-        ) // fps
+        length_in_seconds = math.ceil(
+            n_frames / fps
+        )
 
-        frames_to_lengthen_to = (
+        frames_to_lengthen_to = math.ceil(
             length_in_seconds * fps
         )
 
         return (
             frames_to_lengthen_to,
             length_in_seconds,
+            fps,
         )
         
 

@@ -126,9 +126,32 @@ class ExtractReferenceID:
 
 ### SHOT-ID-TOOLS
 
+SHOT_STAGES = [
+    "firstFrame",
+    "lastFrame",
+    "ffToCleanup",
+    "lfToCleanup",
+    "Depth",
+    "Normal",
+    "cgi",
+    "Scribble",
+    "plate",
+    "plateToCleanup",
+    "notEnhanced",
+    "enhanced",
+]
+
+STAGE_PATTERN = "|".join(map(re.escape, SHOT_STAGES))
+
 REGEX_ID = re.compile(
-    r"(?:[A-Za-z0-9-]+_)?sh[0-9]+_(?:firstFrame|notEnhanced|enhanced|Depth|Normal|cgi|Scribble|lastFrame)_(?:[A-Za-z0-9-]+_)?v(?:[0-9]+|N)"
+    rf"(?:(?P<project_name>[A-Za-z0-9-]+)_)?"
+    rf"(?P<shot>sh[0-9]+)_"
+    rf"(?P<pipeline_step>{STAGE_PATTERN})"
+    rf"(?:_(?P<artist_code>[A-Za-z0-9-]+))?_"
+    rf"(?P<version>v(?:[0-9]+|N))"
 )
+
+ID_COMPONENT_REGEX = re.compile(r"[A-Za-z0-9-]+")
 
 
 class GenerateShotID:
@@ -138,18 +161,7 @@ class GenerateShotID:
             "required": {
                 "project_name": ("STRING", {"default": "NONE", "multiline": False}),
                 "shot_no": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1}),
-                "pipeline_step": (
-                    [
-                        "firstFrame",
-                        "notEnhanced",
-                        "enhanced",
-                        "Depth",
-                        "Normal",
-                        "Scribble",
-                        "lastFrame",
-                        "cgi",
-                    ],
-                ),
+                "pipeline_step": (SHOT_STAGES,),
                 "artist_code": ("STRING", {"default": "NONE", "multiline": False}),
                 "version": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
                 "shot_no_zero_padding": (
@@ -176,24 +188,15 @@ class GenerateShotID:
         project_name = project_name.strip()
         artist_code = artist_code.strip()
 
-        if "_" in project_name:
-            raise ValueError(
-                f"KASKI-Nodes: project_name must not contain underscores: {project_name}"
-            )
 
-        if "_" in artist_code:
+        if project_name not in ("", "NONE") and not ID_COMPONENT_REGEX.fullmatch(project_name):
             raise ValueError(
-                f"KASKI-Nodes: artist_code must not contain underscores: {artist_code}"
+                f"KASKI-Nodes: project_name {project_name} may only contain letters, numbers and hyphens."
             )
-
-        if " " in project_name:
+            
+        if artist_code not in ("", "NONE") and not ID_COMPONENT_REGEX.fullmatch(artist_code):
             raise ValueError(
-                f"KASKI-Nodes: project_name must not contain spaces: {project_name}"
-            )
-
-        if " " in artist_code:
-            raise ValueError(
-                f"KASKI-Nodes: artist_code must not contain spaces: {artist_code}"
+                f"KASKI-Nodes: artist_code {artist_code} may only contain letters, numbers and hyphens."
             )
 
         if version != -1:
@@ -230,19 +233,7 @@ class ModifyShotID:
                 "idx": ("STRING", {"multiline": False}),
                 "project_name": ("STRING", {"default": "KEEP", "multiline": False}),
                 "shot_no": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1}),
-                "pipeline_step": (
-                    [
-                        "KEEP",
-                        "firstFrame",
-                        "notEnhanced",
-                        "enhanced",
-                        "Depth",
-                        "Normal",
-                        "Scribble",
-                        "lastFrame",
-                        "cgi",
-                    ],
-                ),
+                "pipeline_step": (["KEEP", *SHOT_STAGES],),
                 "artist_code": ("STRING", {"default": "KEEP", "multiline": False}),
                 "version": (["Keep", "Increment"],),
                 "shot_no_zero_padding": (
@@ -273,27 +264,17 @@ class ModifyShotID:
         project_name = project_name.strip()
         artist_code = artist_code.strip()
 
-        if "_" in project_name:
+        if project_name not in ("", "NONE") and not ID_COMPONENT_REGEX.fullmatch(project_name):
             raise ValueError(
-                f"KASKI-Nodes: project_name must not contain underscores: {project_name}"
+                f"KASKI-Nodes: project_name {project_name} may only contain letters, numbers and hyphens."
+            )
+            
+        if artist_code not in ("", "NONE") and not ID_COMPONENT_REGEX.fullmatch(artist_code):
+            raise ValueError(
+                f"KASKI-Nodes: artist_code {artist_code} may only contain letters, numbers and hyphens."
             )
 
-        if "_" in artist_code:
-            raise ValueError(
-                f"KASKI-Nodes: artist_code must not contain underscores: {artist_code}"
-            )
-
-        if " " in project_name:
-            raise ValueError(
-                f"KASKI-Nodes: project_name must not contain spaces: {project_name}"
-            )
-
-        if " " in artist_code:
-            raise ValueError(
-                f"KASKI-Nodes: artist_code must not contain spaces: {artist_code}"
-            )
-
-        parts = idx.split("_")
+       
 
         # Possible structures:
         # [sh###, pipeline_step, v#]
@@ -301,32 +282,18 @@ class ModifyShotID:
         # [sh###, pipeline_step, artist_code, v#]
         # [project_name, sh###, pipeline_step, artist_code, v#]
 
-        if len(parts) == 3:
-            old_project_name = ""
-            old_artist_code = ""
-            old_shot, old_pipeline_step, old_version = parts
+        match = REGEX_ID.fullmatch(idx)
 
-        elif len(parts) == 4:
-            if parts[0].startswith("sh"):
-                old_project_name = ""
-                old_shot, old_pipeline_step, old_artist_code, old_version = parts
-            else:
-                old_artist_code = ""
-                old_project_name, old_shot, old_pipeline_step, old_version = parts
-
-        elif len(parts) == 5:
-            (
-                old_project_name,
-                old_shot,
-                old_pipeline_step,
-                old_artist_code,
-                old_version,
-            ) = parts
-
-        else:
+        if not match:
             raise ValueError(
-                f"KASKI-Nodes: Malformed ID (split failed): {idx}"
+                f"KASKI-Nodes: Invalid Shot ID: {idx}"
             )
+
+        old_project_name = match.group("project_name") or ""
+        old_shot = match.group("shot")
+        old_pipeline_step = match.group("pipeline_step")
+        old_artist_code = match.group("artist_code") or ""
+        old_version = match.group("version")
 
         # --- PROJECT NAME ---
         if project_name != "KEEP":
