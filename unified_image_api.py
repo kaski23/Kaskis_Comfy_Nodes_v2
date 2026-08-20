@@ -1891,7 +1891,8 @@ async def _execute_flux2(
 ) -> tuple[torch.Tensor, str, torch.Tensor]:
     settings = _validate_flux2_settings(settings)
 
-    flux_seed = int(seed) & 0x7FFFFFFF
+    if not 0 <= seed <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError("FLUX.2 seed must be an unsigned 64-bit integer.")
 
     flat_images = _collect_image_tensors(images)
     if len(flat_images) > MAX_FLUX2_REFERENCE_IMAGES:
@@ -1916,7 +1917,7 @@ async def _execute_flux2(
             prompt=prompt,
             width=settings["width"],
             height=settings["height"],
-            seed=flux_seed,
+            seed=seed,
             **reference_images,
         ),
     )
