@@ -329,8 +329,7 @@ class ShortenVideo(ComfyNodeABC):
         return video[indices]
 
 
-
-class SeedanceStutterFix(ComfyNodeABC):
+class TemporalSmoother(ComfyNodeABC):
 
     # =========================================================================
     # Settings
@@ -349,44 +348,42 @@ class SeedanceStutterFix(ComfyNodeABC):
             "required": {
                 "images": (
                     "IMAGE",
-                    {"tooltip": "Input IMAGE batch interpreted as a video sequence."},
-                ),
-                "similarity_threshold": (
-                    "FLOAT",
                     {
-                        "default": 0.2,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.01,
-                        "tooltip": "Frames below this continuity threshold are detected as stutters.",
+                        "tooltip":
+                            "Input IMAGE batch interpreted as a video sequence.",
                     },
                 ),
-                "repair": (
+                "resample": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Enable or bypass frame repair. Analysis and frame table are generated either way.",
+                        "tooltip":
+                            "Apply temporal resampling. Analysis always runs.",
                     },
                 ),
-                "repair_method": (
-                    ["rife", "blend"],
-                    {
-                        "default": "rife",
-                        "tooltip": "Interpolation method used to reconstruct frames.",
-                    },
-                ),
-                "repair_target": (
+                "resample_method": (
                     [
-                        "auto",
-                        "hardcore",
-                        "seedance_pattern",
+                        "rife",
+                        "blend",
                     ],
                     {
-                        "default": "auto",
+                        "default": "rife",
+                        "tooltip":
+                            "Method used to generate additional temporal samples.",
+                    },
+                ),
+                "sensitivity": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 2.0,
+                        "step": 0.05,
                         "tooltip": (
-                            "auto uses detected duplicate frames and optical-flow motion; "
-                            "hardcore resamples every second frame; seedance_pattern applies "
-                            "the observed 9/14/19 + 24n Seedance timing pattern."
+                            "Controls how strongly motion deviations affect "
+                            "temporal resampling. 0 disables correction, "
+                            "1 uses measured motion directly, values above "
+                            "1 increase correction strength."
                         ),
                     },
                 ),
@@ -400,7 +397,7 @@ class SeedanceStutterFix(ComfyNodeABC):
 
     RETURN_NAMES = (
         "images",
-        "frame_table",
+        "motion_table",
     )
 
     FUNCTION = "process"
@@ -427,8 +424,15 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         height, width = x.shape[2:4]
 
-        target_height = max(1, round(height * cls.ANALYSIS_SCALE))
-        target_width = max(1, round(width * cls.ANALYSIS_SCALE))
+        target_height = max(
+            1,
+            round(height * cls.ANALYSIS_SCALE),
+        )
+
+        target_width = max(
+            1,
+            round(width * cls.ANALYSIS_SCALE),
+        )
 
         x = F.interpolate(
             x,
@@ -440,7 +444,6 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         return x.permute(0, 2, 3, 1).contiguous()
 
-
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -448,16 +451,13 @@ class SeedanceStutterFix(ComfyNodeABC):
         images: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Calculates one RIFE motion score per frame transition.
+        Calculate one RIFE optical-flow motion score per transition.
 
         motion[0]:
             frame 0 -> frame 1
 
         motion[1]:
             frame 1 -> frame 2
-
-        The score is the mean magnitude of both midpoint-directed
-        RIFE optical-flow fields.
         """
 
         motion_scores = []
@@ -484,68 +484,158 @@ class SeedanceStutterFix(ComfyNodeABC):
                 (magnitude_1 + magnitude_2) * 0.5
             )
 
-        return torch.stack(motion_scores)
-
+        return torch.stack(
+            motion_scores
+        )
 
     # -------------------------------------------------------------------------
 
     @classmethod
-    def _calculate_continuity_scores(
+    def _calculate_motion_baseline(
         cls,
         motion: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compares each transition against its local temporal context.
+        Estimate locally expected motion for each transition.
 
-        1.0:
-            Motion is at least as large as locally expected.
-
-        0.5:
-            Motion is roughly half of locally expected motion.
-
-        0.0:
-            Motion has collapsed completely.
-
-        Lower score = more suspicious.
+        The current transition is excluded from its own baseline.
+        Median is used so local motion outliers have little influence.
         """
 
         count = motion.shape[0]
-        scores = torch.ones_like(motion)
+        baseline = torch.empty_like(motion)
 
         for i in range(count):
 
-            start = max(0, i - cls.TEMPORAL_RADIUS)
-            end = min(count, i + cls.TEMPORAL_RADIUS + 1)
+            start = max(
+                0,
+                i - cls.TEMPORAL_RADIUS,
+            )
+
+            end = min(
+                count,
+                i + cls.TEMPORAL_RADIUS + 1,
+            )
 
             before = motion[start:i]
             after = motion[i + 1:end]
 
-            if before.numel() > 0 and after.numel() > 0:
-                neighbors = torch.cat((before, after))
+            if (
+                before.numel() > 0
+                and after.numel() > 0
+            ):
+
+                neighbors = torch.cat(
+                    (before, after)
+                )
+
             elif before.numel() > 0:
+
                 neighbors = before
+
             elif after.numel() > 0:
+
                 neighbors = after
+
             else:
+
+                baseline[i] = motion[i]
                 continue
 
-            expected_motion = torch.quantile(
+            baseline[i] = torch.quantile(
                 neighbors,
                 0.5,
             )
 
-            if expected_motion <= 1e-8:
-                scores[i] = 1.0
-                continue
+        return baseline
 
-            scores[i] = torch.clamp(
-                motion[i] / expected_motion,
-                min=0.0,
-                max=1.0,
-            )
+    # -------------------------------------------------------------------------
 
-        return scores
+    @staticmethod
+    def _calculate_motion_ratio(
+        motion: torch.Tensor,
+        baseline: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Normalize motion against the local baseline.
 
+        ratio = 1:
+            approximately one normal temporal interval
+
+        ratio > 1:
+            more motion than expected
+
+        ratio < 1:
+            less motion than expected
+        """
+
+        ratio = torch.ones_like(
+            motion
+        )
+
+        valid = baseline > 1e-8
+
+        ratio[valid] = (
+            motion[valid]
+            / baseline[valid]
+        )
+
+        return ratio.clamp_min(
+            0.0
+        )
+
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_sensitivity(
+        motion_ratio: torch.Tensor,
+        sensitivity: float,
+    ) -> torch.Tensor:
+        """
+        Scale deviations from neutral motion in logarithmic space.
+
+        sensitivity = 0:
+            all ratios become 1 -> no temporal correction
+
+        sensitivity = 1:
+            measured ratios remain unchanged
+
+        sensitivity > 1:
+            motion deviations are amplified
+        """
+
+        return (
+            motion_ratio
+            .clamp_min(1e-8)
+            .pow(sensitivity)
+        )
+
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _calculate_target_intervals(
+        adjusted_ratio: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Quantize each transition independently.
+
+        adjusted ratio:
+            < 0.5       -> 0 intervals
+            0.5 - 1.5   -> 1 interval
+            1.5 - 2.5   -> 2 intervals
+            2.5 - 3.5   -> 3 intervals
+            ...
+
+        No cumulative state is carried between transitions.
+        """
+
+        return torch.floor(
+            adjusted_ratio + 0.5
+        ).to(
+            dtype=torch.int64
+        ).clamp_min(
+            0
+        )
 
     # -------------------------------------------------------------------------
 
@@ -553,32 +643,52 @@ class SeedanceStutterFix(ComfyNodeABC):
     def _analyze_images(
         cls,
         images: torch.Tensor,
+        sensitivity: float,
     ):
         """
-        Pure image analysis.
-
-        Does NOT:
-            - apply threshold
-            - generate table
-            - repair anything
+        Build the local temporal motion model.
 
         Returns:
             motion
-            continuity_scores
+            baseline
+            motion_ratio
+            adjusted_ratio
+            target_intervals
         """
 
-        analysis_images = cls._downscale_for_analysis(images)
+        analysis_images = cls._downscale_for_analysis(
+            images
+        )
 
         motion = cls._calculate_frame_motion(
             analysis_images
         )
 
-        continuity_scores = cls._calculate_continuity_scores(
+        baseline = cls._calculate_motion_baseline(
             motion
         )
 
-        return motion, continuity_scores
+        motion_ratio = cls._calculate_motion_ratio(
+            motion,
+            baseline,
+        )
 
+        adjusted_ratio = cls._apply_sensitivity(
+            motion_ratio,
+            sensitivity,
+        )
+
+        target_intervals = cls._calculate_target_intervals(
+            adjusted_ratio
+        )
+
+        return (
+            motion,
+            baseline,
+            motion_ratio,
+            adjusted_ratio,
+            target_intervals,
+        )
 
     # =========================================================================
     # 2. GENERATE TABLE
@@ -587,49 +697,106 @@ class SeedanceStutterFix(ComfyNodeABC):
     @staticmethod
     def _generate_table(
         motion: torch.Tensor,
-        continuity_scores: torch.Tensor,
-        similarity_threshold: float,
+        baseline: torch.Tensor,
+        motion_ratio: torch.Tensor,
+        adjusted_ratio: torch.Tensor,
+        target_intervals: torch.Tensor,
     ) -> list:
         """
-        Converts analysis results into structured frame data.
-
-        This is the ONLY place where the threshold decides whether
-        a frame is KEEP or DETECTED.
-
-        This method knows nothing about repair.
+        Convert temporal analysis into structured transition data.
         """
 
-        motion_cpu = motion.detach().float().cpu()
-        continuity_cpu = continuity_scores.detach().float().cpu()
+        motion_cpu = (
+            motion
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        baseline_cpu = (
+            baseline
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        ratio_cpu = (
+            motion_ratio
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        adjusted_cpu = (
+            adjusted_ratio
+            .detach()
+            .float()
+            .cpu()
+        )
+
+        intervals_cpu = (
+            target_intervals
+            .detach()
+            .cpu()
+        )
 
         table = [{
             "frame": 0,
             "motion": float("inf"),
-            "continuity": float("inf"),
-            "detected": False,
+            "baseline": float("inf"),
+            "motion_ratio": 1.0,
+            "adjusted_ratio": 1.0,
+            "target_intervals": 0,
+            "action": "START",
         }]
 
-        for transition_index in range(continuity_cpu.shape[0]):
+        for transition_index in range(
+            motion_cpu.shape[0]
+        ):
 
-            frame_index = transition_index + 1
+            frame_index = (
+                transition_index + 1
+            )
 
-            motion_score = motion_cpu[
-                transition_index
-            ].item()
+            intervals = int(
+                intervals_cpu[
+                    transition_index
+                ].item()
+            )
 
-            continuity = continuity_cpu[
-                transition_index
-            ].item()
+            if intervals == 0:
+
+                action = "COLLAPSE"
+
+            elif intervals == 1:
+
+                action = "KEEP"
+
+            else:
+
+                action = (
+                    f"INSERT {intervals - 1}"
+                )
 
             table.append({
                 "frame": frame_index,
-                "motion": motion_score,
-                "continuity": continuity,
-                "detected": continuity < similarity_threshold,
+                "motion": motion_cpu[
+                    transition_index
+                ].item(),
+                "baseline": baseline_cpu[
+                    transition_index
+                ].item(),
+                "motion_ratio": ratio_cpu[
+                    transition_index
+                ].item(),
+                "adjusted_ratio": adjusted_cpu[
+                    transition_index
+                ].item(),
+                "target_intervals": intervals,
+                "action": action,
             })
 
         return table
-
 
     # -------------------------------------------------------------------------
 
@@ -637,13 +804,10 @@ class SeedanceStutterFix(ComfyNodeABC):
     def _table_to_string(
         table: list,
     ) -> str:
-        """
-        Human-readable representation of the analysis table.
-        """
 
         rows = [
-            "Frame | Motion     | Continuity | Action",
-            "------+------------+------------+---------",
+            "Frame | Motion     | Baseline   | Ratio    | Adjusted | Intervals | Action",
+            "------+------------+------------+----------+----------+-----------+---------",
         ]
 
         for entry in table:
@@ -651,614 +815,238 @@ class SeedanceStutterFix(ComfyNodeABC):
             frame_index = entry["frame"]
 
             if frame_index == 0:
-                motion = "inf"
-                continuity = "inf"
-            else:
-                motion = f"{entry['motion']:.6f}"
-                continuity = f"{entry['continuity']:.6f}"
 
-            action = (
-                "DETECTED"
-                if entry["detected"]
-                else "KEEP"
-            )
+                motion = "inf"
+                baseline = "inf"
+                ratio = "1.000000"
+                adjusted = "1.000000"
+                intervals = "-"
+
+            else:
+
+                motion = (
+                    f"{entry['motion']:.6f}"
+                )
+
+                baseline = (
+                    f"{entry['baseline']:.6f}"
+                )
+
+                ratio = (
+                    f"{entry['motion_ratio']:.6f}"
+                )
+
+                adjusted = (
+                    f"{entry['adjusted_ratio']:.6f}"
+                )
+
+                intervals = str(
+                    entry["target_intervals"]
+                )
 
             rows.append(
                 f"{frame_index:<5} | "
                 f"{motion:<10} | "
-                f"{continuity:<10} | "
-                f"{action}"
+                f"{baseline:<10} | "
+                f"{ratio:<8} | "
+                f"{adjusted:<8} | "
+                f"{intervals:<9} | "
+                f"{entry['action']}"
             )
 
-        return "\n".join(rows)
+        return "\n".join(
+            rows
+        )
 
     # =========================================================================
-    # 3. REPAIR METHODS
+    # 3. RESAMPLING METHODS
     # =========================================================================
 
     @staticmethod
-    def _repair_rife(
+    def _resample_rife(
         image_1: torch.Tensor,
         image_2: torch.Tensor,
+        timestep: float,
     ) -> torch.Tensor:
-        """
-        image_1:
-            [H,W,C]
-
-        image_2:
-            [H,W,C]
-
-        returns:
-            interpolated midpoint [H,W,C]
-        """
 
         return interpolate_between_two_frames(
             image_1,
             image_2,
+            timestep=timestep,
             model="4.25",
         )
 
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _repair_blend(
+    def _resample_blend(
         image_1: torch.Tensor,
         image_2: torch.Tensor,
+        timestep: float,
     ) -> torch.Tensor:
 
         return torch.lerp(
             image_1,
             image_2,
-            0.5,
+            timestep,
         )
 
     # -------------------------------------------------------------------------
 
     @classmethod
-    def _repair_frame(
+    def _resample_frame(
         cls,
-        repair_method: str,
+        resample_method: str,
         image_1: torch.Tensor,
         image_2: torch.Tensor,
+        timestep: float,
     ) -> torch.Tensor:
-        """
-        Common repair interface:
 
-            [H,W,C]
-            [H,W,C]
+        if resample_method == "rife":
 
-                ↓
-
-            [H,W,C]
-        """
-
-        if repair_method == "rife":
-
-            return cls._repair_rife(
+            return cls._resample_rife(
                 image_1,
                 image_2,
+                timestep,
             )
 
-        if repair_method == "blend":
+        if resample_method == "blend":
 
-            return cls._repair_blend(
+            return cls._resample_blend(
                 image_1,
                 image_2,
+                timestep,
             )
 
         raise ValueError(
-            f"Unknown repair method: {repair_method}"
+            f"Unknown resample method: {resample_method}"
         )
 
     # =========================================================================
-    # 4. FIX STUTTERS
+    # 4. TEMPORAL RESAMPLING
     # =========================================================================
 
     @classmethod
-    def _collapse_duplicate_runs(
+    def _resample_motion(
         cls,
         images: torch.Tensor,
         table: list,
-    ) -> tuple[torch.Tensor, list]:
-        """
-        Collapse runs of 3+ duplicate frames to exactly two frames.
-
-            A B B B C
-            -> A B B C
-
-            A B B B B C
-            -> A B B C
-
-        The first and last duplicate frame are preserved.
-
-        This is the ONLY repair-stage method allowed to shorten
-        the image sequence.
-        """
-
-        output = images.clone()
-
-        working_table = []
-
-        for entry in table:
-            working_entry = entry.copy()
-            working_entry["_original_frame"] = entry["frame"]
-            working_table.append(working_entry)
-
-        i = 1
-
-        while i < len(working_table):
-
-            if not working_table[i]["detected"]:
-                i += 1
-                continue
-
-            run_start = i
-            run_end = i
-
-            while (
-                run_end + 1 < len(working_table)
-                and working_table[run_end + 1]["detected"]
-            ):
-                run_end += 1
-
-            # Multiple consecutive detected transitions mean
-            # at least three duplicate frames.
-            if run_end > run_start:
-
-                keep_mask = torch.ones(
-                    output.shape[0],
-                    dtype=torch.bool,
-                    device=output.device,
-                )
-
-                # Keep first and last duplicate.
-                keep_mask[run_start:run_end] = False
-
-                output = output[keep_mask]
-                del working_table[run_start:run_end]
-
-                i = run_start + 1
-
-            else:
-                i += 1
-
-        # Re-index table after dropped frames.
-        for frame_index, entry in enumerate(working_table):
-            entry["frame"] = frame_index
-
-        return output, working_table
-
-
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def _fix_hardcore(
-        cls,
-        images: torch.Tensor,
-        repair_method: str,
+        resample_method: str,
     ) -> torch.Tensor:
         """
-        Resample every second frame from its direct neighbors.
+        Build a new sequence whose frame density follows locally
+        measured motion.
 
-            A B C D E F G
-              ↓   ↓   ↓
-            A X C X E X G
+        target_intervals == 0:
 
-        Sequence length is preserved.
+            A -> B contains effectively no temporal progress.
+
+            A and B occupy the same temporal slot.
+            The later frame B is kept.
+
+        target_intervals == 1:
+
+            A -> B already represents approximately one normal
+            temporal interval.
+
+            Keep the original transition.
+
+        target_intervals == 2:
+
+            A -------- B
+
+            becomes:
+
+            A ---- X ---- B
+
+        target_intervals == 3:
+
+            A ------------ B
+
+            becomes:
+
+            A ---- X ---- Y ---- B
+
+        There is no upper interval limit.
         """
 
-        source = images
-        output = images.clone()
-
-        repair_indices = list(
-            range(1, images.shape[0] - 1, 2)
-        )
-
-        progress_bar = ProgressBar(
-            len(repair_indices)
-        )
-
-        for frame_index in repair_indices:
-
-            output[frame_index] = cls._repair_frame(
-                repair_method,
-                source[frame_index - 1],
-                source[frame_index + 1],
-            )
-
-            progress_bar.update(1)
-
-        return output
-
-
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def _fix_seedance_pattern(
-        cls,
-        images: torch.Tensor,
-        table: list,
-        repair_method: str,
-    ) -> torch.Tensor:
-        """
-        Apply the observed Seedance temporal pattern independently
-        of detection flags.
-
-        Original frame positions:
-
-            9  + 24n -> replace first duplicate
-            14 + 24n -> choose direction from motion
-            19 + 24n -> replace second duplicate
-
-        Pattern repeats every 24 original frames.
-
-        Frames are never dropped here.
-        """
-
-        output = images.clone()
-
-        if not table:
-            return output
-
-        max_original_frame = max(
-            entry["_original_frame"]
-            for entry in table
-        )
-
-        pattern_actions = []
-
-        block_start = 9
-
-        while block_start <= max_original_frame:
-
-            pattern_actions.extend([
-                (block_start, "REPAIR_FIRST"),
-                (block_start + 5, "AUTO"),
-                (block_start + 10, "REPAIR_SECOND"),
-            ])
-
-            block_start += 24
-
-        pattern_actions = [
-            (frame, action)
-            for frame, action in pattern_actions
-            if frame <= max_original_frame
+        output_frames = [
+            images[0]
         ]
 
-        progress_bar = ProgressBar(
-            len(pattern_actions)
+        generated_frames = sum(
+            max(
+                entry["target_intervals"] - 1,
+                0,
+            )
+            for entry in table[1:]
         )
 
-        for original_frame, action in pattern_actions:
-
-            # Find the current location of the original Seedance frame.
-            # Collapse may already have shifted frame indices.
-            frame_index = next(
-                (
-                    index
-                    for index, entry in enumerate(table)
-                    if entry["_original_frame"] == original_frame
-                ),
-                None,
-            )
-
-            if frame_index is None:
-                progress_bar.update(1)
-                continue
-
-            can_replace_first = frame_index >= 2
-            can_replace_second = (
-                frame_index < output.shape[0] - 1
-            )
-
-            # ---------------------------------------------------------------------
-            # Fixed first duplicate.
-            #
-            # A B B C
-            #   ^
-            # ---------------------------------------------------------------------
-
-            if action == "REPAIR_FIRST":
-
-                if not can_replace_first:
-                    progress_bar.update(1)
-                    continue
-
-                replace_first = True
-
-            # ---------------------------------------------------------------------
-            # Fixed second duplicate.
-            #
-            # A B B C
-            #     ^
-            # ---------------------------------------------------------------------
-
-            elif action == "REPAIR_SECOND":
-
-                if not can_replace_second:
-                    progress_bar.update(1)
-                    continue
-
-                replace_first = False
-
-            # ---------------------------------------------------------------------
-            # Middle Seedance-pattern frame:
-            # choose direction from the original motion analysis.
-            # ---------------------------------------------------------------------
-
-            else:
-
-                if can_replace_first and can_replace_second:
-
-                    left_motion = table[
-                        frame_index - 1
-                    ]["motion"]
-
-                    right_motion = table[
-                        frame_index + 1
-                    ]["motion"]
-
-                    replace_first = (
-                        left_motion > right_motion
-                    )
-
-                elif can_replace_first:
-                    replace_first = True
-
-                elif can_replace_second:
-                    replace_first = False
-
-                else:
-                    progress_bar.update(1)
-                    continue
-
-            # ---------------------------------------------------------------------
-            # Replace first B.
-            # ---------------------------------------------------------------------
-
-            if replace_first:
-
-                repair_index = frame_index - 1
-
-                image_1 = output[
-                    frame_index - 2
-                ]
-
-                image_2 = output[
-                    frame_index
-                ]
-
-            # ---------------------------------------------------------------------
-            # Replace second B.
-            # ---------------------------------------------------------------------
-
-            else:
-
-                repair_index = frame_index
-
-                image_1 = output[
-                    frame_index - 1
-                ]
-
-                image_2 = output[
-                    frame_index + 1
-                ]
-
-            output[repair_index] = cls._repair_frame(
-                repair_method,
-                image_1,
-                image_2,
-            )
-
-            progress_bar.update(1)
-
-        return output
-
-
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def _fix_detected_stutters(
-        cls,
-        images: torch.Tensor,
-        table: list,
-        repair_method: str,
-    ) -> torch.Tensor:
-        """
-        Automatically repair detected duplicate frames.
-
-        For:
-
-            A B B C
-
-        compare motion outside the duplicate pair:
-
-            A -> B > B -> C
-                -> replace first B
-
-            B -> C >= A -> B
-                -> replace second B
-
-        Frames are never dropped here.
-        """
-
-        output = images.clone()
-
-        detected_entries = [
-            entry
-            for entry in table
-            if entry["detected"]
-        ]
-
         progress_bar = ProgressBar(
-            len(detected_entries)
+            generated_frames
         )
 
-        for entry in detected_entries:
-
-            # A B B C
-            #     ^
-            #
-            # frame_index points to the second B.
-
-            frame_index = entry["frame"]
-            frame_count = output.shape[0]
-
-            can_replace_first = frame_index >= 2
-            can_replace_second = (
-                frame_index < frame_count - 1
-            )
-
-            # ---------------------------------------------------------------------
-            # Choose repair direction.
-            # ---------------------------------------------------------------------
-
-            if can_replace_first and can_replace_second:
-
-                left_motion = table[
-                    frame_index - 1
-                ]["motion"]
-
-                right_motion = table[
-                    frame_index + 1
-                ]["motion"]
-
-                replace_first = (
-                    left_motion > right_motion
-                )
-
-            elif can_replace_first:
-                replace_first = True
-
-            elif can_replace_second:
-                replace_first = False
-
-            else:
-                progress_bar.update(1)
-                continue
-
-            # ---------------------------------------------------------------------
-            # Replace first B.
-            #
-            # A B B C
-            #   ^
-            # ---------------------------------------------------------------------
-
-            if replace_first:
-
-                repair_index = frame_index - 1
-
-                image_1 = output[
-                    frame_index - 2
-                ]
-
-                image_2 = output[
-                    frame_index
-                ]
-
-            # ---------------------------------------------------------------------
-            # Replace second B.
-            #
-            # A B B C
-            #     ^
-            # ---------------------------------------------------------------------
-
-            else:
-
-                repair_index = frame_index
-
-                image_1 = output[
-                    frame_index - 1
-                ]
-
-                image_2 = output[
-                    frame_index + 1
-                ]
-
-            # Repair immediately so subsequent repairs see
-            # the already modified image sequence.
-            output[repair_index] = cls._repair_frame(
-                repair_method,
-                image_1,
-                image_2,
-            )
-
-            progress_bar.update(1)
-
-        return output
-
-
-    # -------------------------------------------------------------------------
-
-    @classmethod
-    def _fix_stutters(
-        cls,
-        images: torch.Tensor,
-        table: list,
-        repair_method: str,
-        repair_target: str = "auto",
-    ) -> torch.Tensor:
-        """
-        Repair pipeline:
-
-            1. Collapse 3+ duplicate runs to two frames.
-            2. Run selected repair strategy.
-
-        repair_target:
-
-            auto
-                Repair detected duplicates using optical-flow motion.
-
-            hardcore
-                Resample every second frame.
-
-            seedance_pattern
-                Apply the observed 9 / 14 / 19 + 24n pattern.
-
-        Only the duplicate-collapse pass may change sequence length.
-        """
-
-        if repair_target not in (
-            "auto",
-            "hardcore",
-            "seedance_pattern",
+        for transition_index, entry in enumerate(
+            table[1:]
         ):
-            raise ValueError(
-                f"Unknown repair target: {repair_target}"
+
+            image_1 = images[
+                transition_index
+            ]
+
+            image_2 = images[
+                transition_index + 1
+            ]
+
+            interval_count = entry[
+                "target_intervals"
+            ]
+
+            # -----------------------------------------------------------------
+            # 0 intervals
+            #
+            # Both originals occupy the same temporal slot.
+            # Keep the later frame.
+            # -----------------------------------------------------------------
+
+            if interval_count == 0:
+
+                output_frames[-1] = image_2
+                continue
+
+            # -----------------------------------------------------------------
+            # Insert missing temporal samples.
+            # -----------------------------------------------------------------
+
+            for step in range(
+                1,
+                interval_count,
+            ):
+
+                timestep = (
+                    step
+                    / interval_count
+                )
+
+                output_frames.append(
+                    cls._resample_frame(
+                        resample_method,
+                        image_1,
+                        image_2,
+                        timestep,
+                    )
+                )
+
+                progress_bar.update(1)
+
+            # Original second frame closes the temporal segment.
+            output_frames.append(
+                image_2
             )
 
-        # -------------------------------------------------------------------------
-        # Pass 0: common duplicate-run normalization
-        # -------------------------------------------------------------------------
-
-        filtered_images, working_table = cls._collapse_duplicate_runs(
-            images,
-            table,
-        )
-
-        # -------------------------------------------------------------------------
-        # Pass 1: selected repair strategy
-        # -------------------------------------------------------------------------
-
-        if repair_target == "hardcore":
-
-            return cls._fix_hardcore(
-                filtered_images,
-                repair_method,
-            )
-
-        if repair_target == "seedance_pattern":
-
-            return cls._fix_seedance_pattern(
-                filtered_images,
-                working_table,
-                repair_method,
-            )
-
-        return cls._fix_detected_stutters(
-            filtered_images,
-            working_table,
-            repair_method,
+        return torch.stack(
+            output_frames,
+            dim=0,
         )
 
     # =========================================================================
@@ -1268,111 +1056,134 @@ class SeedanceStutterFix(ComfyNodeABC):
     def process(
         self,
         images: torch.Tensor,
-        similarity_threshold: float,
-        repair: bool,
-        repair_method: str,
-        repair_target: str,
+        resample: bool,
+        resample_method: str,
+        sensitivity: float,
     ):
         """
         Pipeline:
 
-            Analyze Images
+            RIFE Optical Flow
                 ↓
-            Generate Table
+            Local Motion Baseline
                 ↓
-            Generate Table String
+            Motion Ratio
                 ↓
-            repair?
-                ├─ False -> pass original IMAGE through
-                └─ True  -> Fix Stutters
+            Sensitivity
+                ↓
+            Local Interval Quantization
+                ↓
+            Motion Table
+                ↓
+            resample?
+                ├─ False -> original sequence
+                └─ True  -> temporally smoothed sequence
         """
 
         if images.ndim != 4:
+
             raise ValueError(
-                f"Expected IMAGE tensor with shape (B,H,W,C), got {tuple(images.shape)}"
+                f"Expected IMAGE tensor with shape (B,H,W,C), "
+                f"got {tuple(images.shape)}"
             )
 
         frame_count = images.shape[0]
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # No frames
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
 
         if frame_count == 0:
+
             return (
                 images,
-                "Frame | Raw Diff   | Continuity | Action\n"
-                "------+------------+------------+---------",
+                "Frame | Motion     | Baseline   | Ratio    | Adjusted | Intervals | Action\n"
+                "------+------------+------------+----------+----------+-----------+---------",
             )
 
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
         # Single frame
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
 
         if frame_count == 1:
+
             table = [{
                 "frame": 0,
-                "raw_diff": float("inf"),
-                "continuity": float("inf"),
-                "detected": False,
+                "motion": float("inf"),
+                "baseline": float("inf"),
+                "motion_ratio": 1.0,
+                "adjusted_ratio": 1.0,
+                "target_intervals": 0,
+                "action": "START",
             }]
 
             return (
                 images,
-                self._table_to_string(table),
+                self._table_to_string(
+                    table
+                ),
             )
 
-        # -------------------------------------------------------------------------
-        # 1. Analyze
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Analyze
+        # ---------------------------------------------------------------------
 
-        motion, continuity_scores = self._analyze_images(images)
+        (
+            motion,
+            baseline,
+            motion_ratio,
+            adjusted_ratio,
+            target_intervals,
+        ) = self._analyze_images(
+            images,
+            sensitivity,
+        )
 
-        # -------------------------------------------------------------------------
-        # 2. Generate table
-        # -------------------------------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Generate table
+        # ---------------------------------------------------------------------
 
         table = self._generate_table(
             motion,
-            continuity_scores,
-            similarity_threshold,
+            baseline,
+            motion_ratio,
+            adjusted_ratio,
+            target_intervals,
         )
 
-        # -------------------------------------------------------------------------
-        # 3. Generate string output
-        # -------------------------------------------------------------------------
+        motion_table = self._table_to_string(
+            table
+        )
 
-        frame_table = self._table_to_string(table)
+        # ---------------------------------------------------------------------
+        # Resample
+        # ---------------------------------------------------------------------
 
-        # -------------------------------------------------------------------------
-        # 4. Repair — and ONLY this call is bypassed by repair=False
-        # -------------------------------------------------------------------------
+        if resample:
 
-        if repair:
-            output_images = self._fix_stutters(
+            output_images = self._resample_motion(
                 images,
                 table,
-                repair_method,
-                repair_target,
+                resample_method,
             )
-        else:
-            output_images = images
 
-        # -------------------------------------------------------------------------
-        # Output
-        # -------------------------------------------------------------------------
+        else:
+
+            output_images = images
 
         return (
             output_images.contiguous(),
-            frame_table,
+            motion_table,
         )
+
+
 
 
 
 VIDEO_TOOLS_NODE_CLASS_MAPPINGS = {
     "ExtendVideo_KASKI": ExtendVideo,
     "ShortenVideo_KASKI": ShortenVideo,
-    "SeedanceStutterFix_KASKI": SeedanceStutterFix,
+    "TemporalSmoother_KASKI": TemporalSmoother,
 }
 
 
@@ -1380,5 +1191,5 @@ VIDEO_TOOLS_NODE_CLASS_MAPPINGS = {
 VIDEO_TOOLS_NODE_DISPLAY_NAME_MAPPINGS = {
     "ExtendVideo_KASKI": "Extend Video",
     "ShortenVideo_KASKI": "Shorten Video",
-    "SeedanceStutterFix_KASKI": "Seedance Stutter Fix",
+    "TemporalSmoother_KASKI": "Temporal Smoother",
 }

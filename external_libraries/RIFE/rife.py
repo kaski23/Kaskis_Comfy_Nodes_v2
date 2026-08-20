@@ -1015,33 +1015,25 @@ def calculate_optical_flow(
 def interpolate_between_two_frames(
     image_1: torch.Tensor,
     image_2: torch.Tensor,
+    timestep: float = 0.5,
     model: str = "4.25",
 ) -> torch.Tensor:
     """
-    Interpolate the temporal midpoint between two HWC image tensors.
+    Interpolate an arbitrary temporal position between two HWC image tensors.
 
-    Args:
-        image_1:
-            First frame [H,W,C].
-
-        image_2:
-            Second frame [H,W,C].
-
-        model:
-            "4.25" or "4.25.lite".
+    timestep:
+        0.0 -> image_1
+        0.5 -> midpoint
+        1.0 -> image_2
 
     Returns:
-        Midpoint frame [H,W,C].
-
-    The result is returned on the same device and in the same dtype
-    as image_1.
-
-    CUDA:
-        FP16 inference.
-
-    CPU fallback:
-        FP32 inference.
+        Interpolated frame [H,W,C].
     """
+
+    if not 0.0 < timestep < 1.0:
+        raise ValueError(
+            f"RIFE timestep must be between 0 and 1, got {timestep}"
+        )
 
     channel_count = image_1.shape[-1]
 
@@ -1061,27 +1053,19 @@ def interpolate_between_two_frames(
 
     with torch.inference_mode():
 
-        midpoint_rgb = rife_model(
+        interpolated_rgb = rife_model(
             rgb_1,
             rgb_2,
-            timestep=0.5,
+            timestep=timestep,
             return_flow=False,
         )
 
-        midpoint_rgb = midpoint_rgb[
-            :,
-            :,
-            :original_height,
-            :original_width,
-        ]
+        interpolated_rgb = interpolated_rgb[
+            :, :, :original_height, :original_width
+        ].clamp(0.0, 1.0)
 
-        midpoint_rgb = midpoint_rgb.clamp(
-            0.0,
-            1.0,
-        )
-
-    midpoint = (
-        midpoint_rgb[0]
+    interpolated = (
+        interpolated_rgb[0]
         .permute(1, 2, 0)
         .to(
             device=original_device,
@@ -1090,21 +1074,17 @@ def interpolate_between_two_frames(
         .contiguous()
     )
 
-    # RIFE itself only handles RGB.
     if channel_count > 3:
 
         extra_channels = torch.lerp(
             image_1[..., 3:],
             image_2[..., 3:],
-            0.5,
+            timestep,
         )
 
-        midpoint = torch.cat(
-            (
-                midpoint,
-                extra_channels,
-            ),
+        interpolated = torch.cat(
+            (interpolated, extra_channels),
             dim=-1,
         )
 
-    return midpoint
+    return interpolated
