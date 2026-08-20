@@ -350,12 +350,8 @@ class SeedanceStutterFix(ComfyNodeABC):
             "required": {
                 "images": (
                     "IMAGE",
-                    {
-                        "tooltip":
-                            "Input IMAGE batch interpreted as a video sequence."
-                    },
+                    {"tooltip": "Input IMAGE batch interpreted as a video sequence."},
                 ),
-
                 "similarity_threshold": (
                     "FLOAT",
                     {
@@ -363,29 +359,33 @@ class SeedanceStutterFix(ComfyNodeABC):
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.01,
-                        "tooltip":
-                            "Frames below this continuity threshold are detected as stutters.",
+                        "tooltip": "Frames below this continuity threshold are detected as stutters.",
                     },
                 ),
-
                 "repair": (
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip":
-                            "If disabled, analysis still runs but the input sequence is passed through unchanged.",
+                        "tooltip": "Enable or bypass frame repair. Analysis and frame table are generated either way.",
                     },
                 ),
-
                 "repair_method": (
-                    [
-                        "rife",
-                        "blend",
-                    ],
+                    ["rife", "blend"],
                     {
                         "default": "rife",
-                        "tooltip":
-                            "Method used to reconstruct detected frames.",
+                        "tooltip": "Interpolation method used to reconstruct frames.",
+                    },
+                ),
+                "repair_target": (
+                    ["auto", "AXBC", "ABXC", "hardcore"],
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Which frame to replace for a detected A-B-B-C stutter. "
+                            "auto chooses based on surrounding frame differences; "
+                            "AXBC replaces the first B; ABXC replaces the second B; "
+                            "hardcore ignores detection and reconstructs every second frame."
+                        ),
                     },
                 ),
             }
@@ -828,30 +828,104 @@ class SeedanceStutterFix(ComfyNodeABC):
         images: torch.Tensor,
         table: list,
         repair_method: str,
+        repair_target: str = "auto",
     ) -> torch.Tensor:
         """
-        Consumes the analysis table and repairs all detected frames.
+        Repairs detected duplicate frames.
 
         Seedance failure:
 
             A B B C
-                ^
-                detected
 
-        Repair:
+        repair_target:
 
-            A B X C
+            auto:
+                Compare the transitions immediately outside the duplicate pair.
 
-        X is generated between:
-            images[i - 1]
-            images[i + 1]
+                If A -> B is the larger jump:
+                    replace the first B
+                    -> A X B C
+
+                If B -> C is the larger jump:
+                    replace the second B
+                    -> A B X C
+
+            AXBC:
+                Always replace the first B.
+
+            ABXC:
+                Always replace the second B.
+
+            hardcore:
+                Ignore the detection table for repair decisions and resample
+                every second frame:
+
+                    A B C D E F G
+                      ↓   ↓   ↓
+                    A X C X E X G
+
+                Each replaced frame is interpolated from its direct neighbors.
 
         The original sequence length is preserved.
         """
 
+        if repair_target not in (
+            "auto",
+            "AXBC",
+            "ABXC",
+            "hardcore",
+        ):
+            raise ValueError(
+                f"Unknown repair target: {repair_target}"
+            )
+
         output = images.clone()
 
         frame_count = images.shape[0]
+
+        # =========================================================================
+        # Hardcore
+        # =========================================================================
+
+        if repair_target == "hardcore":
+
+            repair_indices = list(
+                range(
+                    1,
+                    frame_count - 1,
+                    2,
+                )
+            )
+
+            progress_bar = ProgressBar(
+                len(repair_indices)
+            )
+
+            for frame_index in repair_indices:
+
+                image_1 = images[
+                    frame_index - 1
+                ]
+
+                image_2 = images[
+                    frame_index + 1
+                ]
+
+                output[
+                    frame_index
+                ] = cls._repair_frame(
+                    repair_method,
+                    image_1,
+                    image_2,
+                )
+
+                progress_bar.update(1)
+
+            return output
+
+        # =========================================================================
+        # Detection-based repair
+        # =========================================================================
 
         detected_entries = [
             entry
@@ -865,24 +939,136 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         for entry in detected_entries:
 
+            # For:
+            #
+            # A B B C
+            #     ^
+            #
+            # frame_index points to the SECOND B.
+
             frame_index = entry["frame"]
 
-            # Cannot generate an intermediate frame if there is
-            # no frame after the detected one.
-            if frame_index >= frame_count - 1:
-                progress_bar.update(1)
-                continue
+            selected_target = repair_target
 
-            image_1 = images[
-                frame_index - 1
-            ]
+            # ---------------------------------------------------------------------
+            # Auto-select which duplicate frame to replace.
+            # ---------------------------------------------------------------------
 
-            image_2 = images[
-                frame_index + 1
-            ]
+            if repair_target == "auto":
+
+                can_replace_first = (
+                    frame_index >= 2
+                )
+
+                can_replace_second = (
+                    frame_index < frame_count - 1
+                )
+
+                if (
+                    can_replace_first
+                    and can_replace_second
+                ):
+
+                    # table[n]["raw_diff"] describes:
+                    #
+                    # frame n-1 -> frame n
+                    #
+                    # Therefore:
+                    #
+                    # table[frame_index - 1]:
+                    #     A -> first B
+                    #
+                    # table[frame_index + 1]:
+                    #     second B -> C
+
+                    left_diff = table[
+                        frame_index - 1
+                    ]["raw_diff"]
+
+                    right_diff = table[
+                        frame_index + 1
+                    ]["raw_diff"]
+
+                    if left_diff > right_diff:
+                        selected_target = "AXBC"
+                    else:
+                        selected_target = "ABXC"
+
+                elif can_replace_first:
+
+                    selected_target = "AXBC"
+
+                elif can_replace_second:
+
+                    selected_target = "ABXC"
+
+                else:
+
+                    progress_bar.update(1)
+                    continue
+
+            # ---------------------------------------------------------------------
+            # AXBC
+            #
+            # Original:
+            #
+            # A B B C
+            #   ^
+            #
+            # Replace first B using A and second B.
+            # ---------------------------------------------------------------------
+
+            if selected_target == "AXBC":
+
+                if frame_index < 2:
+                    progress_bar.update(1)
+                    continue
+
+                repair_index = (
+                    frame_index - 1
+                )
+
+                image_1 = images[
+                    frame_index - 2
+                ]
+
+                image_2 = images[
+                    frame_index
+                ]
+
+            # ---------------------------------------------------------------------
+            # ABXC
+            #
+            # Original:
+            #
+            # A B B C
+            #     ^
+            #
+            # Replace second B using first B and C.
+            # ---------------------------------------------------------------------
+
+            elif selected_target == "ABXC":
+
+                if frame_index >= frame_count - 1:
+                    progress_bar.update(1)
+                    continue
+
+                repair_index = frame_index
+
+                image_1 = images[
+                    frame_index - 1
+                ]
+
+                image_2 = images[
+                    frame_index + 1
+                ]
+
+            # ---------------------------------------------------------------------
+            # Repair selected frame.
+            # ---------------------------------------------------------------------
 
             output[
-                frame_index
+                repair_index
             ] = cls._repair_frame(
                 repair_method,
                 image_1,
@@ -903,6 +1089,7 @@ class SeedanceStutterFix(ComfyNodeABC):
         similarity_threshold: float,
         repair: bool,
         repair_method: str,
+        repair_target: str,
     ):
         """
         Pipeline:
@@ -919,62 +1106,49 @@ class SeedanceStutterFix(ComfyNodeABC):
         """
 
         if images.ndim != 4:
-
             raise ValueError(
-                "Expected IMAGE tensor with shape "
-                f"(B,H,W,C), got {tuple(images.shape)}"
+                f"Expected IMAGE tensor with shape (B,H,W,C), got {tuple(images.shape)}"
             )
 
         frame_count = images.shape[0]
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # No frames
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         if frame_count == 0:
-
             return (
                 images,
                 "Frame | Raw Diff   | Continuity | Action\n"
                 "------+------------+------------+---------",
             )
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # Single frame
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         if frame_count == 1:
-
-            table = [
-                {
-                    "frame": 0,
-                    "raw_diff": float("inf"),
-                    "continuity": float("inf"),
-                    "detected": False,
-                }
-            ]
+            table = [{
+                "frame": 0,
+                "raw_diff": float("inf"),
+                "continuity": float("inf"),
+                "detected": False,
+            }]
 
             return (
                 images,
-                self._table_to_string(
-                    table
-                ),
+                self._table_to_string(table),
             )
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # 1. Analyze
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
-        (
-            differences,
-            continuity_scores,
-        ) = self._analyze_images(
-            images
-        )
+        differences, continuity_scores = self._analyze_images(images)
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # 2. Generate table
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         table = self._generate_table(
             differences,
@@ -982,33 +1156,29 @@ class SeedanceStutterFix(ComfyNodeABC):
             similarity_threshold,
         )
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # 3. Generate string output
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
-        frame_table = self._table_to_string(
-            table
-        )
+        frame_table = self._table_to_string(table)
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # 4. Repair — and ONLY this call is bypassed by repair=False
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         if repair:
-
             output_images = self._fix_stutters(
                 images,
                 table,
                 repair_method,
+                repair_target,
             )
-
         else:
-
             output_images = images
 
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
         # Output
-        # ---------------------------------------------------------------------
+        # -------------------------------------------------------------------------
 
         return (
             output_images.contiguous(),
