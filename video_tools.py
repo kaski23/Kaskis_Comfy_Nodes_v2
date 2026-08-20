@@ -376,14 +376,17 @@ class SeedanceStutterFix(ComfyNodeABC):
                     },
                 ),
                 "repair_target": (
-                    ["auto", "AXBC", "ABXC", "hardcore"],
+                    [
+                        "auto",
+                        "hardcore",
+                        "seedance_pattern",
+                    ],
                     {
                         "default": "auto",
                         "tooltip": (
-                            "Which frame to replace for a detected A-B-B-C stutter. "
-                            "auto chooses based on surrounding frame differences; "
-                            "AXBC replaces the first B; ABXC replaces the second B; "
-                            "hardcore ignores detection and reconstructs every second frame."
+                            "auto uses detected duplicate frames and optical-flow motion; "
+                            "hardcore resamples every second frame; seedance_pattern applies "
+                            "the observed 9/14/19 + 24n Seedance timing pattern."
                         ),
                     },
                 ),
@@ -752,46 +755,34 @@ class SeedanceStutterFix(ComfyNodeABC):
     # =========================================================================
 
     @classmethod
-    def _fix_stutters(
+    def _collapse_duplicate_runs(
         cls,
         images: torch.Tensor,
         table: list,
-        repair_method: str,
-        repair_target: str = "auto",
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list]:
+        """
+        Collapse runs of 3+ duplicate frames to exactly two frames.
 
-        if repair_target not in (
-            "auto",
-            "AXBC",
-            "ABXC",
-            "hardcore",
-        ):
-            raise ValueError(
-                f"Unknown repair target: {repair_target}"
-            )
+            A B B B C
+            -> A B B C
+
+            A B B B B C
+            -> A B B C
+
+        The first and last duplicate frame are preserved.
+
+        This is the ONLY repair-stage method allowed to shorten
+        the image sequence.
+        """
 
         output = images.clone()
 
-        working_table = [
-            entry.copy()
-            for entry in table
-        ]
+        working_table = []
 
-        # =========================================================================
-        # Pass 0: Collapse triple / quad / ... duplicates to exactly two frames
-        #
-        # A B B B C
-        #     ^ ^
-        #
-        # -> A B B C
-        #
-        # A B B B B C
-        #     ^ ^ ^
-        #
-        # -> A B B C
-        #
-        # First and last B are preserved.
-        # =========================================================================
+        for entry in table:
+            working_entry = entry.copy()
+            working_entry["_original_frame"] = entry["frame"]
+            working_table.append(working_entry)
 
         i = 1
 
@@ -810,16 +801,9 @@ class SeedanceStutterFix(ComfyNodeABC):
             ):
                 run_end += 1
 
-            # A single detected entry is the normal A B B C case.
-            # Two or more consecutive detections mean 3+ duplicate frames.
+            # Multiple consecutive detected transitions mean
+            # at least three duplicate frames.
             if run_end > run_start:
-
-                # Keep:
-                #   first B = frame run_start - 1
-                #   last  B = frame run_end
-                #
-                # Drop everything in between:
-                #   run_start ... run_end - 1
 
                 keep_mask = torch.ones(
                     output.shape[0],
@@ -827,63 +811,282 @@ class SeedanceStutterFix(ComfyNodeABC):
                     device=output.device,
                 )
 
+                # Keep first and last duplicate.
                 keep_mask[run_start:run_end] = False
 
                 output = output[keep_mask]
+                del working_table[run_start:run_end]
 
-                del working_table[
-                    run_start:run_end
-                ]
-
-                # The original last B is now at run_start and remains detected.
-                # Continue after it.
                 i = run_start + 1
 
             else:
                 i += 1
 
-        # Table indices must match the filtered sequence.
+        # Re-index table after dropped frames.
         for frame_index, entry in enumerate(working_table):
             entry["frame"] = frame_index
 
-        frame_count = output.shape[0]
+        return output, working_table
 
-        # =========================================================================
-        # Hardcore
-        # =========================================================================
 
-        if repair_target == "hardcore":
+    # -------------------------------------------------------------------------
 
-            # Work from the already filtered sequence.
-            source = output.clone()
+    @classmethod
+    def _fix_hardcore(
+        cls,
+        images: torch.Tensor,
+        repair_method: str,
+    ) -> torch.Tensor:
+        """
+        Resample every second frame from its direct neighbors.
 
-            repair_indices = list(
-                range(1, frame_count - 1, 2)
+            A B C D E F G
+              ↓   ↓   ↓
+            A X C X E X G
+
+        Sequence length is preserved.
+        """
+
+        source = images
+        output = images.clone()
+
+        repair_indices = list(
+            range(1, images.shape[0] - 1, 2)
+        )
+
+        progress_bar = ProgressBar(
+            len(repair_indices)
+        )
+
+        for frame_index in repair_indices:
+
+            output[frame_index] = cls._repair_frame(
+                repair_method,
+                source[frame_index - 1],
+                source[frame_index + 1],
             )
 
-            progress_bar = ProgressBar(
-                len(repair_indices)
-            )
+            progress_bar.update(1)
 
-            for frame_index in repair_indices:
+        return output
 
-                output[frame_index] = cls._repair_frame(
-                    repair_method,
-                    source[frame_index - 1],
-                    source[frame_index + 1],
-                )
 
-                progress_bar.update(1)
+    # -------------------------------------------------------------------------
 
+    @classmethod
+    def _fix_seedance_pattern(
+        cls,
+        images: torch.Tensor,
+        table: list,
+        repair_method: str,
+    ) -> torch.Tensor:
+        """
+        Apply the observed Seedance temporal pattern independently
+        of detection flags.
+
+        Original frame positions:
+
+            9  + 24n -> replace first duplicate
+            14 + 24n -> choose direction from motion
+            19 + 24n -> replace second duplicate
+
+        Pattern repeats every 24 original frames.
+
+        Frames are never dropped here.
+        """
+
+        output = images.clone()
+
+        if not table:
             return output
 
-        # =========================================================================
-        # Detection-based repair
-        # =========================================================================
+        max_original_frame = max(
+            entry["_original_frame"]
+            for entry in table
+        )
+
+        pattern_actions = []
+
+        block_start = 9
+
+        while block_start <= max_original_frame:
+
+            pattern_actions.extend([
+                (block_start, "REPAIR_FIRST"),
+                (block_start + 5, "AUTO"),
+                (block_start + 10, "REPAIR_SECOND"),
+            ])
+
+            block_start += 24
+
+        pattern_actions = [
+            (frame, action)
+            for frame, action in pattern_actions
+            if frame <= max_original_frame
+        ]
+
+        progress_bar = ProgressBar(
+            len(pattern_actions)
+        )
+
+        for original_frame, action in pattern_actions:
+
+            # Find the current location of the original Seedance frame.
+            # Collapse may already have shifted frame indices.
+            frame_index = next(
+                (
+                    index
+                    for index, entry in enumerate(table)
+                    if entry["_original_frame"] == original_frame
+                ),
+                None,
+            )
+
+            if frame_index is None:
+                progress_bar.update(1)
+                continue
+
+            can_replace_first = frame_index >= 2
+            can_replace_second = (
+                frame_index < output.shape[0] - 1
+            )
+
+            # ---------------------------------------------------------------------
+            # Fixed first duplicate.
+            #
+            # A B B C
+            #   ^
+            # ---------------------------------------------------------------------
+
+            if action == "REPAIR_FIRST":
+
+                if not can_replace_first:
+                    progress_bar.update(1)
+                    continue
+
+                replace_first = True
+
+            # ---------------------------------------------------------------------
+            # Fixed second duplicate.
+            #
+            # A B B C
+            #     ^
+            # ---------------------------------------------------------------------
+
+            elif action == "REPAIR_SECOND":
+
+                if not can_replace_second:
+                    progress_bar.update(1)
+                    continue
+
+                replace_first = False
+
+            # ---------------------------------------------------------------------
+            # Middle Seedance-pattern frame:
+            # choose direction from the original motion analysis.
+            # ---------------------------------------------------------------------
+
+            else:
+
+                if can_replace_first and can_replace_second:
+
+                    left_motion = table[
+                        frame_index - 1
+                    ]["motion"]
+
+                    right_motion = table[
+                        frame_index + 1
+                    ]["motion"]
+
+                    replace_first = (
+                        left_motion > right_motion
+                    )
+
+                elif can_replace_first:
+                    replace_first = True
+
+                elif can_replace_second:
+                    replace_first = False
+
+                else:
+                    progress_bar.update(1)
+                    continue
+
+            # ---------------------------------------------------------------------
+            # Replace first B.
+            # ---------------------------------------------------------------------
+
+            if replace_first:
+
+                repair_index = frame_index - 1
+
+                image_1 = output[
+                    frame_index - 2
+                ]
+
+                image_2 = output[
+                    frame_index
+                ]
+
+            # ---------------------------------------------------------------------
+            # Replace second B.
+            # ---------------------------------------------------------------------
+
+            else:
+
+                repair_index = frame_index
+
+                image_1 = output[
+                    frame_index - 1
+                ]
+
+                image_2 = output[
+                    frame_index + 1
+                ]
+
+            output[repair_index] = cls._repair_frame(
+                repair_method,
+                image_1,
+                image_2,
+            )
+
+            progress_bar.update(1)
+
+        return output
+
+
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def _fix_detected_stutters(
+        cls,
+        images: torch.Tensor,
+        table: list,
+        repair_method: str,
+    ) -> torch.Tensor:
+        """
+        Automatically repair detected duplicate frames.
+
+        For:
+
+            A B B C
+
+        compare motion outside the duplicate pair:
+
+            A -> B > B -> C
+                -> replace first B
+
+            B -> C >= A -> B
+                -> replace second B
+
+        Frames are never dropped here.
+        """
+
+        output = images.clone()
 
         detected_entries = [
             entry
-            for entry in working_table
+            for entry in table
             if entry["detected"]
         ]
 
@@ -899,51 +1102,49 @@ class SeedanceStutterFix(ComfyNodeABC):
             # frame_index points to the second B.
 
             frame_index = entry["frame"]
-            selected_target = repair_target
+            frame_count = output.shape[0]
+
+            can_replace_first = frame_index >= 2
+            can_replace_second = (
+                frame_index < frame_count - 1
+            )
 
             # ---------------------------------------------------------------------
-            # Auto
+            # Choose repair direction.
             # ---------------------------------------------------------------------
 
-            if repair_target == "auto":
+            if can_replace_first and can_replace_second:
 
-                can_replace_first = frame_index >= 2
-                can_replace_second = frame_index < frame_count - 1
+                left_motion = table[
+                    frame_index - 1
+                ]["motion"]
 
-                if can_replace_first and can_replace_second:
+                right_motion = table[
+                    frame_index + 1
+                ]["motion"]
 
-                    left_motion = working_table[
-                        frame_index - 1
-                    ]["motion"]
+                replace_first = (
+                    left_motion > right_motion
+                )
 
-                    right_motion = working_table[
-                        frame_index + 1
-                    ]["motion"]
+            elif can_replace_first:
+                replace_first = True
 
-                    if left_motion > right_motion:
-                        selected_target = "AXBC"
-                    else:
-                        selected_target = "ABXC"
+            elif can_replace_second:
+                replace_first = False
 
-                elif can_replace_first:
-                    selected_target = "AXBC"
-
-                elif can_replace_second:
-                    selected_target = "ABXC"
-
-                else:
-                    progress_bar.update(1)
-                    continue
+            else:
+                progress_bar.update(1)
+                continue
 
             # ---------------------------------------------------------------------
-            # AXBC
+            # Replace first B.
+            #
+            # A B B C
+            #   ^
             # ---------------------------------------------------------------------
 
-            if selected_target == "AXBC":
-
-                if frame_index < 2:
-                    progress_bar.update(1)
-                    continue
+            if replace_first:
 
                 repair_index = frame_index - 1
 
@@ -956,14 +1157,13 @@ class SeedanceStutterFix(ComfyNodeABC):
                 ]
 
             # ---------------------------------------------------------------------
-            # ABXC
+            # Replace second B.
+            #
+            # A B B C
+            #     ^
             # ---------------------------------------------------------------------
 
-            elif selected_target == "ABXC":
-
-                if frame_index >= frame_count - 1:
-                    progress_bar.update(1)
-                    continue
+            else:
 
                 repair_index = frame_index
 
@@ -975,7 +1175,8 @@ class SeedanceStutterFix(ComfyNodeABC):
                     frame_index + 1
                 ]
 
-            # Immediately replace the frame in the current sequence.
+            # Repair immediately so subsequent repairs see
+            # the already modified image sequence.
             output[repair_index] = cls._repair_frame(
                 repair_method,
                 image_1,
@@ -985,6 +1186,80 @@ class SeedanceStutterFix(ComfyNodeABC):
             progress_bar.update(1)
 
         return output
+
+
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def _fix_stutters(
+        cls,
+        images: torch.Tensor,
+        table: list,
+        repair_method: str,
+        repair_target: str = "auto",
+    ) -> torch.Tensor:
+        """
+        Repair pipeline:
+
+            1. Collapse 3+ duplicate runs to two frames.
+            2. Run selected repair strategy.
+
+        repair_target:
+
+            auto
+                Repair detected duplicates using optical-flow motion.
+
+            hardcore
+                Resample every second frame.
+
+            seedance_pattern
+                Apply the observed 9 / 14 / 19 + 24n pattern.
+
+        Only the duplicate-collapse pass may change sequence length.
+        """
+
+        if repair_target not in (
+            "auto",
+            "hardcore",
+            "seedance_pattern",
+        ):
+            raise ValueError(
+                f"Unknown repair target: {repair_target}"
+            )
+
+        # -------------------------------------------------------------------------
+        # Pass 0: common duplicate-run normalization
+        # -------------------------------------------------------------------------
+
+        filtered_images, working_table = cls._collapse_duplicate_runs(
+            images,
+            table,
+        )
+
+        # -------------------------------------------------------------------------
+        # Pass 1: selected repair strategy
+        # -------------------------------------------------------------------------
+
+        if repair_target == "hardcore":
+
+            return cls._fix_hardcore(
+                filtered_images,
+                repair_method,
+            )
+
+        if repair_target == "seedance_pattern":
+
+            return cls._fix_seedance_pattern(
+                filtered_images,
+                working_table,
+                repair_method,
+            )
+
+        return cls._fix_detected_stutters(
+            filtered_images,
+            working_table,
+            repair_method,
+        )
 
     # =========================================================================
     # 5. NODE ORCHESTRATION
