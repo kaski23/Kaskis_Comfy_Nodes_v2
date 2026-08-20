@@ -375,7 +375,7 @@ class TemporalSmoother(ComfyNodeABC):
                 "sensitivity": (
                     "FLOAT",
                     {
-                        "default": 1.0,
+                        "default": 0.7,
                         "min": 0.0,
                         "max": 2.0,
                         "step": 0.05,
