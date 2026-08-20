@@ -1,19 +1,22 @@
 """
 Minimal vendored RIFE 4.25 inference backend.
 
-This module intentionally has no ComfyUI dependency. Its public API is exported
-through this package's __init__.py as:
+Public API is exported through this package's __init__.py:
 
+    calculate_optical_flow(image_1, image_2, model="4.25")
     interpolate_between_two_frames(image_1, image_2, model="4.25")
 
-Input/output tensors use HWC layout and are expected to contain RGB values in
-[0, 1].
+Input image tensors:
+    [H, W, C], floating point, normally [0, 1]
+
+Optical-flow outputs:
+    [H, W, 2]
 
 Supported model variants:
     - "4.25"
     - "4.25.lite"
 
-Expected weight files relative to this file:
+Expected weight files:
     models/flownet_v4.25.pkl
     models/flownet_v4.25.lite.pkl
 """
@@ -38,7 +41,6 @@ _KASKI_RIFE_MODELS_DIR = _KASKI_RIFE_PACKAGE_DIR / "models"
 # Model configuration
 # =============================================================================
 
-
 @dataclass(frozen=True)
 class _ModelConfig:
     weights_file: str
@@ -54,7 +56,6 @@ _KASKI_RIFE_MODEL_CONFIGS: Dict[str, _ModelConfig] = {
         scale_list=(16.0, 8.0, 4.0, 2.0, 1.0),
         modulo=64,
     ),
-
     "4.25.lite": _ModelConfig(
         weights_file="flownet_v4.25.lite.pkl",
         block_channels=(192, 128, 96, 64, 24),
@@ -68,45 +69,22 @@ _KASKI_RIFE_MODEL_CONFIGS: Dict[str, _ModelConfig] = {
 # Caches
 # =============================================================================
 
-
-# Loaded RIFE models stay cached.
-#
-# CUDA:
-#     model stays on GPU in FP16
-#
-# CPU fallback:
-#     model stays on CPU in FP32
-#
-# Key:
-#     model name
-#     device
-#     dtype
-
 _KASKI_MODEL_CACHE: Dict[
     Tuple[str, str, torch.dtype],
     "_IFNet",
 ] = {}
-
 _KASKI_MODEL_CACHE_LOCK = Lock()
-
-
-# Cached grids used for backward warping.
-#
-# Dtype is part of the cache key because CUDA inference uses FP16
-# while CPU inference uses FP32.
 
 _KASKI_GRID_CACHE: Dict[
     Tuple[str, torch.dtype, int, int],
     torch.Tensor,
 ] = {}
-
 _KASKI_GRID_CACHE_LOCK = Lock()
 
 
 # =============================================================================
-# Network building blocks
+# Network blocks
 # =============================================================================
-
 
 def _conv(
     in_channels: int,
@@ -127,14 +105,8 @@ def _conv(
             dilation=dilation,
             bias=True,
         ),
-        nn.LeakyReLU(
-            0.2,
-            inplace=True,
-        ),
+        nn.LeakyReLU(0.2, inplace=True),
     )
-
-
-# -----------------------------------------------------------------------------
 
 
 class _Head(nn.Module):
@@ -142,69 +114,19 @@ class _Head(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        self.cnn0 = nn.Conv2d(
-            3,
-            16,
-            3,
-            2,
-            1,
-        )
+        self.cnn0 = nn.Conv2d(3, 16, 3, 2, 1)
+        self.cnn1 = nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn2 = nn.Conv2d(16, 16, 3, 1, 1)
+        self.cnn3 = nn.ConvTranspose2d(16, 4, 4, 2, 1)
 
-        self.cnn1 = nn.Conv2d(
-            16,
-            16,
-            3,
-            1,
-            1,
-        )
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
 
-        self.cnn2 = nn.Conv2d(
-            16,
-            16,
-            3,
-            1,
-            1,
-        )
-
-        self.cnn3 = nn.ConvTranspose2d(
-            16,
-            4,
-            4,
-            2,
-            1,
-        )
-
-        self.relu = nn.LeakyReLU(
-            0.2,
-            inplace=True,
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-
-        x = x.clamp(
-            0.0,
-            1.0,
-        )
-
-        x = self.relu(
-            self.cnn0(x)
-        )
-
-        x = self.relu(
-            self.cnn1(x)
-        )
-
-        x = self.relu(
-            self.cnn2(x)
-        )
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.clamp(0.0, 1.0)
+        x = self.relu(self.cnn0(x))
+        x = self.relu(self.cnn1(x))
+        x = self.relu(self.cnn2(x))
         return self.cnn3(x)
-
-
-# -----------------------------------------------------------------------------
 
 
 class _ResConv(nn.Module):
@@ -228,34 +150,15 @@ class _ResConv(nn.Module):
         )
 
         self.beta = nn.Parameter(
-            torch.ones(
-                (
-                    1,
-                    channels,
-                    1,
-                    1,
-                )
-            )
+            torch.ones((1, channels, 1, 1))
         )
 
-        self.relu = nn.LeakyReLU(
-            0.2,
-            inplace=True,
-        )
+        self.relu = nn.LeakyReLU(0.2, inplace=True)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.relu(
-            self.conv(x)
-            * self.beta
-            + x
+            self.conv(x) * self.beta + x
         )
-
-
-# -----------------------------------------------------------------------------
 
 
 class _IFBlock(nn.Module):
@@ -269,38 +172,16 @@ class _IFBlock(nn.Module):
         super().__init__()
 
         self.conv0 = nn.Sequential(
-            _conv(
-                in_channels,
-                channels // 2,
-                3,
-                2,
-                1,
-            ),
-
-            _conv(
-                channels // 2,
-                channels,
-                3,
-                2,
-                1,
-            ),
+            _conv(in_channels, channels // 2, 3, 2, 1),
+            _conv(channels // 2, channels, 3, 2, 1),
         )
 
         self.convblock = nn.Sequential(
-            *[
-                _ResConv(channels)
-                for _ in range(8)
-            ]
+            *[_ResConv(channels) for _ in range(8)]
         )
 
-        # 52 channels
-        # -> PixelShuffle(2)
-        # -> 13 channels:
-        #
-        # 4 flow
-        # 1 mask
-        # 8 recurrent features
-
+        # 52 channels -> PixelShuffle(2) -> 13 channels:
+        # 4 flow, 1 mask, 8 recurrent features.
         self.lastconv = nn.Sequential(
             nn.ConvTranspose2d(
                 channels,
@@ -309,7 +190,6 @@ class _IFBlock(nn.Module):
                 2,
                 1,
             ),
-
             nn.PixelShuffle(2),
         )
 
@@ -318,11 +198,7 @@ class _IFBlock(nn.Module):
         x: torch.Tensor,
         flow: torch.Tensor | None,
         scale: float,
-    ) -> Tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
         x = F.interpolate(
             x,
@@ -332,7 +208,6 @@ class _IFBlock(nn.Module):
         )
 
         if flow is not None:
-
             scaled_flow = F.interpolate(
                 flow,
                 scale_factor=1.0 / scale,
@@ -341,10 +216,7 @@ class _IFBlock(nn.Module):
             ) / scale
 
             x = torch.cat(
-                (
-                    x,
-                    scaled_flow,
-                ),
+                (x, scaled_flow),
                 dim=1,
             )
 
@@ -352,9 +224,7 @@ class _IFBlock(nn.Module):
             self.conv0(x)
         )
 
-        output = self.lastconv(
-            features
-        )
+        output = self.lastconv(features)
 
         output = F.interpolate(
             output,
@@ -363,20 +233,9 @@ class _IFBlock(nn.Module):
             align_corners=False,
         )
 
-        delta_flow = (
-            output[:, :4]
-            * scale
-        )
-
-        mask = output[
-            :,
-            4:5,
-        ]
-
-        recurrent_features = output[
-            :,
-            5:,
-        ]
+        delta_flow = output[:, :4] * scale
+        mask = output[:, 4:5]
+        recurrent_features = output[:, 5:]
 
         return (
             delta_flow,
@@ -388,7 +247,6 @@ class _IFBlock(nn.Module):
 # =============================================================================
 # Warping
 # =============================================================================
-
 
 def _get_base_grid(
     device: torch.device,
@@ -406,9 +264,7 @@ def _get_base_grid(
 
     with _KASKI_GRID_CACHE_LOCK:
 
-        cached = _KASKI_GRID_CACHE.get(
-            key
-        )
+        cached = _KASKI_GRID_CACHE.get(key)
 
         if cached is not None:
             return cached
@@ -420,15 +276,9 @@ def _get_base_grid(
             device=device,
             dtype=dtype,
         ).view(
-            1,
-            1,
-            1,
-            width,
+            1, 1, 1, width
         ).expand(
-            1,
-            1,
-            height,
-            width,
+            1, 1, height, width
         )
 
         vertical = torch.linspace(
@@ -438,33 +288,19 @@ def _get_base_grid(
             device=device,
             dtype=dtype,
         ).view(
-            1,
-            1,
-            height,
-            1,
+            1, 1, height, 1
         ).expand(
-            1,
-            1,
-            height,
-            width,
+            1, 1, height, width
         )
 
         grid = torch.cat(
-            (
-                horizontal,
-                vertical,
-            ),
+            (horizontal, vertical),
             dim=1,
         )
 
-        _KASKI_GRID_CACHE[
-            key
-        ] = grid
+        _KASKI_GRID_CACHE[key] = grid
 
         return grid
-
-
-# -----------------------------------------------------------------------------
 
 
 def _warp(
@@ -473,34 +309,19 @@ def _warp(
 ) -> torch.Tensor:
     """
     Backward warp using RIFE's normalized optical-flow convention.
-
-    CUDA:
-        FP16 throughout.
-
-    CPU:
-        FP32 throughout.
-
-    No forced FP32 conversion is performed here.
     """
 
     _, _, height, width = image.shape
 
-    dtype = image.dtype
-
-    if flow.dtype != dtype:
-        flow = flow.to(
-            dtype=dtype
-        )
+    if flow.dtype != image.dtype:
+        flow = flow.to(dtype=image.dtype)
 
     base_grid = _get_base_grid(
         device=image.device,
-        dtype=dtype,
+        dtype=image.dtype,
         height=height,
         width=width,
     )
-
-    # Convert pixel displacement to grid_sample's
-    # normalized [-1, 1] coordinate space.
 
     x_divisor = max(
         (width - 1.0) / 2.0,
@@ -514,11 +335,8 @@ def _warp(
 
     normalized_flow = torch.cat(
         (
-            flow[:, 0:1]
-            / x_divisor,
-
-            flow[:, 1:2]
-            / y_divisor,
+            flow[:, 0:1] / x_divisor,
+            flow[:, 1:2] / y_divisor,
         ),
         dim=1,
     )
@@ -527,10 +345,7 @@ def _warp(
         base_grid
         + normalized_flow
     ).permute(
-        0,
-        2,
-        3,
-        1,
+        0, 2, 3, 1
     )
 
     return F.grid_sample(
@@ -546,7 +361,6 @@ def _warp(
 # IFNet
 # =============================================================================
 
-
 class _IFNet(nn.Module):
 
     def __init__(
@@ -556,82 +370,32 @@ class _IFNet(nn.Module):
 
         super().__init__()
 
-        (
-            c0,
-            c1,
-            c2,
-            c3,
-            c4,
-        ) = config.block_channels
-
-        # First block receives:
-        #
-        # RGB0
-        # RGB1
-        # encoded features 0
-        # encoded features 1
-        # timestep
-
-        self.block0 = _IFBlock(
-            15,
-            c0,
+        c0, c1, c2, c3, c4 = (
+            config.block_channels
         )
 
-        # Later blocks receive current warped images,
-        # features, mask, timestep and recurrent features.
-        #
-        # Flow itself is concatenated inside _IFBlock.forward().
-
-        self.block1 = _IFBlock(
-            28,
-            c1,
-        )
-
-        self.block2 = _IFBlock(
-            28,
-            c2,
-        )
-
-        self.block3 = _IFBlock(
-            28,
-            c3,
-        )
-
-        self.block4 = _IFBlock(
-            28,
-            c4,
-        )
+        self.block0 = _IFBlock(15, c0)
+        self.block1 = _IFBlock(28, c1)
+        self.block2 = _IFBlock(28, c2)
+        self.block3 = _IFBlock(28, c3)
+        self.block4 = _IFBlock(28, c4)
 
         self.encode = _Head()
-
-        self.scale_list = (
-            config.scale_list
-        )
+        self.scale_list = config.scale_list
 
     def forward(
         self,
         image_0: torch.Tensor,
         image_1: torch.Tensor,
         timestep: float = 0.5,
+        return_flow: bool = False,
     ) -> torch.Tensor:
 
-        image_0 = image_0.clamp(
-            0.0,
-            1.0,
-        )
+        image_0 = image_0.clamp(0.0, 1.0)
+        image_1 = image_1.clamp(0.0, 1.0)
 
-        image_1 = image_1.clamp(
-            0.0,
-            1.0,
-        )
-
-        features_0 = self.encode(
-            image_0
-        )
-
-        features_1 = self.encode(
-            image_1
-        )
+        features_0 = self.encode(image_0)
+        features_1 = self.encode(image_1)
 
         time_map = torch.full(
             (
@@ -660,9 +424,7 @@ class _IFNet(nn.Module):
         mask = None
         recurrent_features = None
 
-        for index, block in enumerate(
-            blocks
-        ):
+        for index, block in enumerate(blocks):
 
             if flow is None:
 
@@ -677,16 +439,10 @@ class _IFNet(nn.Module):
                     dim=1,
                 )
 
-                (
-                    flow,
-                    mask,
-                    recurrent_features,
-                ) = block(
+                flow, mask, recurrent_features = block(
                     block_input,
                     flow=None,
-                    scale=self.scale_list[
-                        index
-                    ],
+                    scale=self.scale_list[index],
                 )
 
             else:
@@ -714,22 +470,13 @@ class _IFNet(nn.Module):
                     dim=1,
                 )
 
-                (
-                    delta_flow,
-                    mask,
-                    recurrent_features,
-                ) = block(
+                delta_flow, mask, recurrent_features = block(
                     block_input,
                     flow=flow,
-                    scale=self.scale_list[
-                        index
-                    ],
+                    scale=self.scale_list[index],
                 )
 
-                flow = (
-                    flow
-                    + delta_flow
-                )
+                flow = flow + delta_flow
 
             warped_0 = _warp(
                 image_0,
@@ -741,15 +488,14 @@ class _IFNet(nn.Module):
                 flow[:, 2:4],
             )
 
-        blend_mask = torch.sigmoid(
-            mask
-        )
+        if return_flow:
+            return flow
+
+        blend_mask = torch.sigmoid(mask)
 
         return (
-            warped_0
-            * blend_mask
-            + warped_1
-            * (1.0 - blend_mask)
+            warped_0 * blend_mask
+            + warped_1 * (1.0 - blend_mask)
         )
 
 
@@ -757,42 +503,26 @@ class _IFNet(nn.Module):
 # Weight loading
 # =============================================================================
 
-
 def _normalize_state_dict(
     raw_state: object,
-) -> Dict[
-    str,
-    torch.Tensor,
-]:
+) -> Dict[str, torch.Tensor]:
 
-    if isinstance(
-        raw_state,
-        dict,
-    ):
+    if isinstance(raw_state, dict):
 
         for candidate_key in (
             "state_dict",
             "model",
             "flownet",
         ):
-
             candidate = raw_state.get(
                 candidate_key
             )
 
-            if isinstance(
-                candidate,
-                dict,
-            ):
-
+            if isinstance(candidate, dict):
                 raw_state = candidate
                 break
 
-    if not isinstance(
-        raw_state,
-        dict,
-    ):
-
+    if not isinstance(raw_state, dict):
         raise RuntimeError(
             "RIFE weights do not contain a state dictionary."
         )
@@ -815,7 +545,6 @@ def _normalize_state_dict(
         while clean_key.startswith(
             "module."
         ):
-
             clean_key = clean_key[
                 len("module.") :
             ]
@@ -823,17 +552,13 @@ def _normalize_state_dict(
         if clean_key.startswith(
             "flownet."
         ):
-
             clean_key = clean_key[
                 len("flownet.") :
             ]
 
-        cleaned[
-            clean_key
-        ] = value
+        cleaned[clean_key] = value
 
     if not cleaned:
-
         raise RuntimeError(
             "RIFE state dictionary is empty after key normalization."
         )
@@ -841,18 +566,11 @@ def _normalize_state_dict(
     return cleaned
 
 
-# -----------------------------------------------------------------------------
-
-
 def _load_state_dict(
     path: Path,
-) -> Dict[
-    str,
-    torch.Tensor,
-]:
+) -> Dict[str, torch.Tensor]:
 
     if not path.is_file():
-
         raise FileNotFoundError(
             f"RIFE weights not found: {path}\n"
             "Expected both model files inside "
@@ -860,7 +578,6 @@ def _load_state_dict(
         )
 
     try:
-
         raw_state = torch.load(
             path,
             map_location="cpu",
@@ -868,7 +585,6 @@ def _load_state_dict(
         )
 
     except TypeError:
-
         raw_state = torch.load(
             path,
             map_location="cpu",
@@ -883,26 +599,21 @@ def _load_state_dict(
 # Device / dtype
 # =============================================================================
 
-
 def _get_inference_device(
     input_device: torch.device,
 ) -> torch.device:
     """
     Prefer CUDA.
 
-    If the input frame already lives on CUDA, use that same CUDA device.
-
-    If the input frame lives elsewhere but CUDA is available, use the
-    currently active CUDA device.
-
-    If CUDA is unavailable, fall back to CPU.
+    If input already lives on CUDA, use that device.
+    Otherwise use the current CUDA device if available.
+    Fall back to CPU if CUDA is unavailable.
     """
 
     if input_device.type == "cuda":
         return input_device
 
     if torch.cuda.is_available():
-
         return torch.device(
             "cuda",
             torch.cuda.current_device(),
@@ -913,12 +624,7 @@ def _get_inference_device(
         "Falling back to CPU inference."
     )
 
-    return torch.device(
-        "cpu"
-    )
-
-
-# -----------------------------------------------------------------------------
+    return torch.device("cpu")
 
 
 def _select_inference_dtype(
@@ -935,26 +641,18 @@ def _select_inference_dtype(
 # Model cache
 # =============================================================================
 
-
 def _get_model(
     model_name: str,
     device: torch.device,
     dtype: torch.dtype,
-) -> Tuple[
-    _IFNet,
-    _ModelConfig,
-]:
+) -> Tuple[_IFNet, _ModelConfig]:
 
     try:
-
-        config = (
-            _KASKI_RIFE_MODEL_CONFIGS[
-                model_name
-            ]
-        )
+        config = _KASKI_RIFE_MODEL_CONFIGS[
+            model_name
+        ]
 
     except KeyError as exc:
-
         supported = ", ".join(
             sorted(
                 _KASKI_RIFE_MODEL_CONFIGS
@@ -974,34 +672,25 @@ def _get_model(
 
     with _KASKI_MODEL_CACHE_LOCK:
 
-        cached = (
-            _KASKI_MODEL_CACHE.get(
-                cache_key
-            )
+        cached = _KASKI_MODEL_CACHE.get(
+            cache_key
         )
 
         if cached is not None:
+            return cached, config
 
-            return (
-                cached,
-                config,
-            )
-
-        model = _IFNet(
-            config
-        )
+        model = _IFNet(config)
 
         state_dict = _load_state_dict(
             _KASKI_RIFE_MODELS_DIR
             / config.weights_file
         )
 
-        (
-            missing_keys,
-            _unexpected_keys,
-        ) = model.load_state_dict(
-            state_dict,
-            strict=False,
+        missing_keys, _unexpected_keys = (
+            model.load_state_dict(
+                state_dict,
+                strict=False,
+            )
         )
 
         if missing_keys:
@@ -1011,10 +700,7 @@ def _get_model(
             )
 
             if len(missing_keys) > 8:
-
-                missing_preview += (
-                    ", ..."
-                )
+                missing_preview += ", ..."
 
             raise RuntimeError(
                 f"RIFE checkpoint '{config.weights_file}' "
@@ -1024,13 +710,7 @@ def _get_model(
             )
 
         model.eval()
-
-        model.requires_grad_(
-            False
-        )
-
-        # CUDA -> model lives in FP16 on GPU.
-        # CPU  -> model lives in FP32 on CPU.
+        model.requires_grad_(False)
 
         model.to(
             device=device,
@@ -1041,16 +721,12 @@ def _get_model(
             cache_key
         ] = model
 
-        return (
-            model,
-            config,
-        )
+        return model, config
 
 
 # =============================================================================
 # Padding
 # =============================================================================
-
 
 def _pad_to_modulo(
     image_0: torch.Tensor,
@@ -1067,37 +743,19 @@ def _pad_to_modulo(
     width = image_0.shape[3]
 
     padded_height = (
-        (
-            height
-            + modulo
-            - 1
-        )
+        (height + modulo - 1)
         // modulo
     ) * modulo
 
     padded_width = (
-        (
-            width
-            + modulo
-            - 1
-        )
+        (width + modulo - 1)
         // modulo
     ) * modulo
 
-    pad_right = (
-        padded_width
-        - width
-    )
+    pad_right = padded_width - width
+    pad_bottom = padded_height - height
 
-    pad_bottom = (
-        padded_height
-        - height
-    )
-
-    if (
-        pad_right
-        or pad_bottom
-    ):
+    if pad_right or pad_bottom:
 
         padding = (
             0,
@@ -1125,9 +783,8 @@ def _pad_to_modulo(
 
 
 # =============================================================================
-# Input validation
+# Input validation / preparation
 # =============================================================================
-
 
 def _validate_input_frames(
     image_1: torch.Tensor,
@@ -1138,7 +795,6 @@ def _validate_input_frames(
         not torch.is_tensor(image_1)
         or not torch.is_tensor(image_2)
     ):
-
         raise TypeError(
             "RIFE inputs must be torch.Tensor instances."
         )
@@ -1147,7 +803,6 @@ def _validate_input_frames(
         image_1.ndim != 3
         or image_2.ndim != 3
     ):
-
         raise ValueError(
             "RIFE expects individual HWC frames. "
             f"Received {tuple(image_1.shape)} "
@@ -1155,7 +810,6 @@ def _validate_input_frames(
         )
 
     if image_1.shape != image_2.shape:
-
         raise ValueError(
             "RIFE input frames must have identical shapes. "
             f"Received {tuple(image_1.shape)} "
@@ -1163,14 +817,12 @@ def _validate_input_frames(
         )
 
     if image_1.shape[-1] < 3:
-
         raise ValueError(
             "RIFE requires at least 3 channels, "
             f"got {image_1.shape[-1]}."
         )
 
     if image_1.device != image_2.device:
-
         raise ValueError(
             "RIFE input frames must be on the same device. "
             f"Received {image_1.device} "
@@ -1181,16 +833,184 @@ def _validate_input_frames(
         not image_1.is_floating_point()
         or not image_2.is_floating_point()
     ):
-
         raise TypeError(
             "RIFE expects floating-point frame tensors in [0, 1]."
         )
 
 
+def _prepare_rife_inputs(
+    image_1: torch.Tensor,
+    image_2: torch.Tensor,
+    model: str,
+):
+    """
+    Shared preparation for optical-flow and interpolation calls.
+    """
+
+    _validate_input_frames(
+        image_1,
+        image_2,
+    )
+
+    original_device = image_1.device
+    original_dtype = image_1.dtype
+
+    inference_device = _get_inference_device(
+        original_device
+    )
+
+    inference_dtype = _select_inference_dtype(
+        inference_device
+    )
+
+    rife_model, config = _get_model(
+        model,
+        inference_device,
+        inference_dtype,
+    )
+
+    rgb_1 = (
+        image_1[..., :3]
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .contiguous()
+        .to(
+            device=inference_device,
+            dtype=inference_dtype,
+        )
+    )
+
+    rgb_2 = (
+        image_2[..., :3]
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .contiguous()
+        .to(
+            device=inference_device,
+            dtype=inference_dtype,
+        )
+    )
+
+    (
+        rgb_1,
+        rgb_2,
+        original_height,
+        original_width,
+    ) = _pad_to_modulo(
+        rgb_1,
+        rgb_2,
+        config.modulo,
+    )
+
+    return (
+        rife_model,
+        rgb_1,
+        rgb_2,
+        original_height,
+        original_width,
+        original_device,
+        original_dtype,
+    )
+
+
 # =============================================================================
-# Public API
+# Public API: Optical Flow
 # =============================================================================
 
+def calculate_optical_flow(
+    image_1: torch.Tensor,
+    image_2: torch.Tensor,
+    model: str = "4.25",
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    Calculate RIFE optical flow between two HWC frames.
+
+    Args:
+        image_1:
+            First frame [H,W,C].
+
+        image_2:
+            Second frame [H,W,C].
+
+        model:
+            "4.25" or "4.25.lite".
+
+    Returns:
+        flow_image_1:
+            [H,W,2]
+
+        flow_image_2:
+            [H,W,2]
+
+    The two flow fields are the final midpoint-directed flow fields
+    RIFE uses internally to warp image_1 and image_2.
+
+    Outputs are returned on the same device and in the same dtype
+    as image_1.
+    """
+
+    (
+        rife_model,
+        rgb_1,
+        rgb_2,
+        original_height,
+        original_width,
+        original_device,
+        original_dtype,
+    ) = _prepare_rife_inputs(
+        image_1,
+        image_2,
+        model,
+    )
+
+    with torch.inference_mode():
+
+        flow = rife_model(
+            rgb_1,
+            rgb_2,
+            timestep=0.5,
+            return_flow=True,
+        )
+
+        flow = flow[
+            :,
+            :,
+            :original_height,
+            :original_width,
+        ]
+
+    flow_image_1 = (
+        flow[0, :2]
+        .permute(1, 2, 0)
+        .to(
+            device=original_device,
+            dtype=original_dtype,
+        )
+        .contiguous()
+    )
+
+    flow_image_2 = (
+        flow[0, 2:4]
+        .permute(1, 2, 0)
+        .to(
+            device=original_device,
+            dtype=original_dtype,
+        )
+        .contiguous()
+    )
+
+    return (
+        flow_image_1,
+        flow_image_2,
+    )
+
+
+# =============================================================================
+# Public API: Frame interpolation
+# =============================================================================
 
 def interpolate_between_two_frames(
     image_1: torch.Tensor,
@@ -1208,129 +1028,35 @@ def interpolate_between_two_frames(
             Second frame [H,W,C].
 
         model:
-            "4.25"
-            or
-            "4.25.lite"
+            "4.25" or "4.25.lite".
 
     Returns:
         Midpoint frame [H,W,C].
 
-        The result is returned on the same device and in the same dtype
-        as image_1.
+    The result is returned on the same device and in the same dtype
+    as image_1.
 
-    Device behavior:
-        Input on CUDA:
-            use that CUDA device directly.
+    CUDA:
+        FP16 inference.
 
-        Input outside CUDA + CUDA available:
-            move only image_1 and image_2 to CUDA for RIFE inference.
-
-        CUDA unavailable:
-            run on CPU in FP32.
-
-    Precision:
-        CUDA:
-            FP16
-
-        CPU:
-            FP32
+    CPU fallback:
+        FP32 inference.
     """
 
-    _validate_input_frames(
-        image_1,
-        image_2,
-    )
-
-    original_device = (
-        image_1.device
-    )
-
-    original_dtype = (
-        image_1.dtype
-    )
-
-    channel_count = (
-        image_1.shape[-1]
-    )
-
-    inference_device = (
-        _get_inference_device(
-            original_device
-        )
-    )
-
-    inference_dtype = (
-        _select_inference_dtype(
-            inference_device
-        )
-    )
-
-    rife_model, config = (
-        _get_model(
-            model,
-            inference_device,
-            inference_dtype,
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Prepare exactly the two frames required for this interpolation.
-    #
-    # If they are already on the inference GPU, no device transfer happens.
-    # Otherwise only these two frame tensors are transferred.
-    # -------------------------------------------------------------------------
-
-    rgb_1 = (
-        image_1[
-            ...,
-            :3,
-        ]
-        .permute(
-            2,
-            0,
-            1,
-        )
-        .unsqueeze(0)
-        .contiguous()
-        .to(
-            device=inference_device,
-            dtype=inference_dtype,
-        )
-    )
-
-    rgb_2 = (
-        image_2[
-            ...,
-            :3,
-        ]
-        .permute(
-            2,
-            0,
-            1,
-        )
-        .unsqueeze(0)
-        .contiguous()
-        .to(
-            device=inference_device,
-            dtype=inference_dtype,
-        )
-    )
-
-    # -------------------------------------------------------------------------
-    # Full-resolution inference.
-    #
-    # No 0.5 optical-flow scaling. Maximum-quality RIFE path.
-    # -------------------------------------------------------------------------
+    channel_count = image_1.shape[-1]
 
     (
+        rife_model,
         rgb_1,
         rgb_2,
         original_height,
         original_width,
-    ) = _pad_to_modulo(
-        rgb_1,
-        rgb_2,
-        config.modulo,
+        original_device,
+        original_dtype,
+    ) = _prepare_rife_inputs(
+        image_1,
+        image_2,
+        model,
     )
 
     with torch.inference_mode():
@@ -1339,6 +1065,7 @@ def interpolate_between_two_frames(
             rgb_1,
             rgb_2,
             timestep=0.5,
+            return_flow=False,
         )
 
         midpoint_rgb = midpoint_rgb[
@@ -1353,23 +1080,9 @@ def interpolate_between_two_frames(
             1.0,
         )
 
-    # -------------------------------------------------------------------------
-    # Return to the device / dtype Comfy originally supplied.
-    #
-    # CPU input:
-    #     result returns to CPU.
-    #
-    # CUDA input:
-    #     result stays on that CUDA device.
-    # -------------------------------------------------------------------------
-
     midpoint = (
         midpoint_rgb[0]
-        .permute(
-            1,
-            2,
-            0,
-        )
+        .permute(1, 2, 0)
         .to(
             device=original_device,
             dtype=original_dtype,
@@ -1377,21 +1090,12 @@ def interpolate_between_two_frames(
         .contiguous()
     )
 
-    # -------------------------------------------------------------------------
-    # Preserve non-RGB channels by midpoint blending.
-    # -------------------------------------------------------------------------
-
+    # RIFE itself only handles RGB.
     if channel_count > 3:
 
         extra_channels = torch.lerp(
-            image_1[
-                ...,
-                3:,
-            ],
-            image_2[
-                ...,
-                3:,
-            ],
+            image_1[..., 3:],
+            image_2[..., 3:],
             0.5,
         )
 

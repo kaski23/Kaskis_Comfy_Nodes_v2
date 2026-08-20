@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 from comfy.comfy_types import ComfyNodeABC
 
-from .external_libraries.RIFE import interpolate_between_two_frames
+from .external_libraries.RIFE import calculate_optical_flow, interpolate_between_two_frames
 from comfy.utils import ProgressBar
 
 class ExtendVideo(ComfyNodeABC):
@@ -338,7 +338,6 @@ class SeedanceStutterFix(ComfyNodeABC):
 
     ANALYSIS_SCALE = 0.2
     TEMPORAL_RADIUS = 2
-    MOTION_TEMPERATURE = 0.01
 
     # =========================================================================
     # ComfyUI
@@ -417,134 +416,114 @@ class SeedanceStutterFix(ComfyNodeABC):
         Comfy IMAGE:
             [B,H,W,C]
 
-        Analysis tensor:
-            [B,C,H*0.2,W*0.2]
+        Analysis IMAGE:
+            [B,H*scale,W*scale,C]
         """
 
-        x = images.permute(
-            0,
-            3,
-            1,
-            2,
-        ).float()
+        x = images.permute(0, 3, 1, 2).float()
 
-        height = x.shape[2]
-        width = x.shape[3]
+        height, width = x.shape[2:4]
 
-        target_height = max(
-            1,
-            round(height * cls.ANALYSIS_SCALE),
-        )
+        target_height = max(1, round(height * cls.ANALYSIS_SCALE))
+        target_width = max(1, round(width * cls.ANALYSIS_SCALE))
 
-        target_width = max(
-            1,
-            round(width * cls.ANALYSIS_SCALE),
-        )
-
-        return F.interpolate(
+        x = F.interpolate(
             x,
-            size=(
-                target_height,
-                target_width,
-            ),
+            size=(target_height, target_width),
             mode="bicubic",
             align_corners=False,
             antialias=True,
         )
 
+        return x.permute(0, 2, 3, 1).contiguous()
+
+
     # -------------------------------------------------------------------------
 
     @staticmethod
-    def _calculate_frame_differences(
+    def _calculate_frame_motion(
         images: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Returns one difference value per transition.
+        Calculates one RIFE motion score per frame transition.
 
-        differences[0]:
+        motion[0]:
             frame 0 -> frame 1
 
-        differences[1]:
+        motion[1]:
             frame 1 -> frame 2
+
+        The score is the mean magnitude of both midpoint-directed
+        RIFE optical-flow fields.
         """
 
-        previous = images[:-1]
-        current = images[1:]
+        motion_scores = []
 
-        return torch.abs(
-            current - previous
-        ).mean(
-            dim=(1, 2, 3)
-        )
+        for i in range(images.shape[0] - 1):
+
+            flow_1, flow_2 = calculate_optical_flow(
+                images[i],
+                images[i + 1],
+                model="4.25",
+            )
+
+            magnitude_1 = torch.linalg.vector_norm(
+                flow_1,
+                dim=-1,
+            ).mean()
+
+            magnitude_2 = torch.linalg.vector_norm(
+                flow_2,
+                dim=-1,
+            ).mean()
+
+            motion_scores.append(
+                (magnitude_1 + magnitude_2) * 0.5
+            )
+
+        return torch.stack(motion_scores)
+
 
     # -------------------------------------------------------------------------
 
     @classmethod
     def _calculate_continuity_scores(
         cls,
-        differences: torch.Tensor,
+        motion: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compares every frame transition against its local temporal context.
+        Compares each transition against its local temporal context.
 
         1.0:
-            Current difference is at least as large as expected.
+            Motion is at least as large as locally expected.
 
-        < 1.0:
-            Difference has collapsed relative to surrounding transitions.
+        0.5:
+            Motion is roughly half of locally expected motion.
+
+        0.0:
+            Motion has collapsed completely.
 
         Lower score = more suspicious.
         """
 
-        count = differences.shape[0]
-
-        scores = torch.ones_like(
-            differences
-        )
+        count = motion.shape[0]
+        scores = torch.ones_like(motion)
 
         for i in range(count):
 
-            start = max(
-                0,
-                i - cls.TEMPORAL_RADIUS,
-            )
+            start = max(0, i - cls.TEMPORAL_RADIUS)
+            end = min(count, i + cls.TEMPORAL_RADIUS + 1)
 
-            end = min(
-                count,
-                i + cls.TEMPORAL_RADIUS + 1,
-            )
+            before = motion[start:i]
+            after = motion[i + 1:end]
 
-            before = differences[
-                start:i
-            ]
-
-            after = differences[
-                i + 1:end
-            ]
-
-            if (
-                before.numel() > 0
-                and after.numel() > 0
-            ):
-
-                neighbors = torch.cat(
-                    (
-                        before,
-                        after,
-                    )
-                )
-
+            if before.numel() > 0 and after.numel() > 0:
+                neighbors = torch.cat((before, after))
             elif before.numel() > 0:
-
                 neighbors = before
-
             elif after.numel() > 0:
-
                 neighbors = after
-
             else:
-
-                scores[i] = 1.0
                 continue
 
             expected_motion = torch.quantile(
@@ -552,29 +531,18 @@ class SeedanceStutterFix(ComfyNodeABC):
                 0.5,
             )
 
-            current_motion = differences[i]
+            if expected_motion <= 1e-8:
+                scores[i] = 1.0
+                continue
 
-            motion_delta = (
-                current_motion
-                - expected_motion
+            scores[i] = torch.clamp(
+                motion[i] / expected_motion,
+                min=0.0,
+                max=1.0,
             )
 
-            if motion_delta < 0:
-
-                scores[i] = torch.clamp(
-                    torch.exp(
-                        motion_delta
-                        / cls.MOTION_TEMPERATURE
-                    ),
-                    min=0.0,
-                    max=1.0,
-                )
-
-            else:
-
-                scores[i] = 1.0
-
         return scores
+
 
     # -------------------------------------------------------------------------
 
@@ -592,26 +560,22 @@ class SeedanceStutterFix(ComfyNodeABC):
             - repair anything
 
         Returns:
-            differences
+            motion
             continuity_scores
         """
 
-        analysis_images = cls._downscale_for_analysis(
-            images
-        )
+        analysis_images = cls._downscale_for_analysis(images)
 
-        differences = cls._calculate_frame_differences(
+        motion = cls._calculate_frame_motion(
             analysis_images
         )
 
         continuity_scores = cls._calculate_continuity_scores(
-            differences
+            motion
         )
 
-        return (
-            differences,
-            continuity_scores,
-        )
+        return motion, continuity_scores
+
 
     # =========================================================================
     # 2. GENERATE TABLE
@@ -619,7 +583,7 @@ class SeedanceStutterFix(ComfyNodeABC):
 
     @staticmethod
     def _generate_table(
-        differences: torch.Tensor,
+        motion: torch.Tensor,
         continuity_scores: torch.Tensor,
         similarity_threshold: float,
     ) -> list:
@@ -632,38 +596,21 @@ class SeedanceStutterFix(ComfyNodeABC):
         This method knows nothing about repair.
         """
 
-        differences_cpu = (
-            differences
-            .detach()
-            .float()
-            .cpu()
-        )
+        motion_cpu = motion.detach().float().cpu()
+        continuity_cpu = continuity_scores.detach().float().cpu()
 
-        continuity_cpu = (
-            continuity_scores
-            .detach()
-            .float()
-            .cpu()
-        )
+        table = [{
+            "frame": 0,
+            "motion": float("inf"),
+            "continuity": float("inf"),
+            "detected": False,
+        }]
 
-        table = [
-            {
-                "frame": 0,
-                "raw_diff": float("inf"),
-                "continuity": float("inf"),
-                "detected": False,
-            }
-        ]
+        for transition_index in range(continuity_cpu.shape[0]):
 
-        for transition_index in range(
-            continuity_cpu.shape[0]
-        ):
+            frame_index = transition_index + 1
 
-            frame_index = (
-                transition_index + 1
-            )
-
-            raw_diff = differences_cpu[
+            motion_score = motion_cpu[
                 transition_index
             ].item()
 
@@ -671,21 +618,15 @@ class SeedanceStutterFix(ComfyNodeABC):
                 transition_index
             ].item()
 
-            detected = (
-                continuity
-                < similarity_threshold
-            )
-
-            table.append(
-                {
-                    "frame": frame_index,
-                    "raw_diff": raw_diff,
-                    "continuity": continuity,
-                    "detected": detected,
-                }
-            )
+            table.append({
+                "frame": frame_index,
+                "motion": motion_score,
+                "continuity": continuity,
+                "detected": continuity < similarity_threshold,
+            })
 
         return table
+
 
     # -------------------------------------------------------------------------
 
@@ -695,12 +636,10 @@ class SeedanceStutterFix(ComfyNodeABC):
     ) -> str:
         """
         Human-readable representation of the analysis table.
-
-        This is display only.
         """
 
         rows = [
-            "Frame | Raw Diff   | Continuity | Action",
+            "Frame | Motion     | Continuity | Action",
             "------+------------+------------+---------",
         ]
 
@@ -709,19 +648,11 @@ class SeedanceStutterFix(ComfyNodeABC):
             frame_index = entry["frame"]
 
             if frame_index == 0:
-
-                raw_diff = "inf"
+                motion = "inf"
                 continuity = "inf"
-
             else:
-
-                raw_diff = (
-                    f"{entry['raw_diff']:.6f}"
-                )
-
-                continuity = (
-                    f"{entry['continuity']:.6f}"
-                )
+                motion = f"{entry['motion']:.6f}"
+                continuity = f"{entry['continuity']:.6f}"
 
             action = (
                 "DETECTED"
@@ -731,14 +662,12 @@ class SeedanceStutterFix(ComfyNodeABC):
 
             rows.append(
                 f"{frame_index:<5} | "
-                f"{raw_diff:<10} | "
+                f"{motion:<10} | "
                 f"{continuity:<10} | "
                 f"{action}"
             )
 
-        return "\n".join(
-            rows
-        )
+        return "\n".join(rows)
 
     # =========================================================================
     # 3. REPAIR METHODS
@@ -830,44 +759,6 @@ class SeedanceStutterFix(ComfyNodeABC):
         repair_method: str,
         repair_target: str = "auto",
     ) -> torch.Tensor:
-        """
-        Repairs detected duplicate frames.
-
-        Seedance failure:
-
-            A B B C
-
-        repair_target:
-
-            auto:
-                Compare the transitions immediately outside the duplicate pair.
-
-                If A -> B is the larger jump:
-                    replace the first B
-                    -> A X B C
-
-                If B -> C is the larger jump:
-                    replace the second B
-                    -> A B X C
-
-            AXBC:
-                Always replace the first B.
-
-            ABXC:
-                Always replace the second B.
-
-            hardcore:
-                Ignore the detection table for repair decisions and resample
-                every second frame:
-
-                    A B C D E F G
-                      ↓   ↓   ↓
-                    A X C X E X G
-
-                Each replaced frame is interpolated from its direct neighbors.
-
-        The original sequence length is preserved.
-        """
 
         if repair_target not in (
             "auto",
@@ -881,7 +772,81 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         output = images.clone()
 
-        frame_count = images.shape[0]
+        working_table = [
+            entry.copy()
+            for entry in table
+        ]
+
+        # =========================================================================
+        # Pass 0: Collapse triple / quad / ... duplicates to exactly two frames
+        #
+        # A B B B C
+        #     ^ ^
+        #
+        # -> A B B C
+        #
+        # A B B B B C
+        #     ^ ^ ^
+        #
+        # -> A B B C
+        #
+        # First and last B are preserved.
+        # =========================================================================
+
+        i = 1
+
+        while i < len(working_table):
+
+            if not working_table[i]["detected"]:
+                i += 1
+                continue
+
+            run_start = i
+            run_end = i
+
+            while (
+                run_end + 1 < len(working_table)
+                and working_table[run_end + 1]["detected"]
+            ):
+                run_end += 1
+
+            # A single detected entry is the normal A B B C case.
+            # Two or more consecutive detections mean 3+ duplicate frames.
+            if run_end > run_start:
+
+                # Keep:
+                #   first B = frame run_start - 1
+                #   last  B = frame run_end
+                #
+                # Drop everything in between:
+                #   run_start ... run_end - 1
+
+                keep_mask = torch.ones(
+                    output.shape[0],
+                    dtype=torch.bool,
+                    device=output.device,
+                )
+
+                keep_mask[run_start:run_end] = False
+
+                output = output[keep_mask]
+
+                del working_table[
+                    run_start:run_end
+                ]
+
+                # The original last B is now at run_start and remains detected.
+                # Continue after it.
+                i = run_start + 1
+
+            else:
+                i += 1
+
+        # Table indices must match the filtered sequence.
+        for frame_index, entry in enumerate(working_table):
+            entry["frame"] = frame_index
+
+        frame_count = output.shape[0]
 
         # =========================================================================
         # Hardcore
@@ -889,12 +854,11 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         if repair_target == "hardcore":
 
+            # Work from the already filtered sequence.
+            source = output.clone()
+
             repair_indices = list(
-                range(
-                    1,
-                    frame_count - 1,
-                    2,
-                )
+                range(1, frame_count - 1, 2)
             )
 
             progress_bar = ProgressBar(
@@ -903,20 +867,10 @@ class SeedanceStutterFix(ComfyNodeABC):
 
             for frame_index in repair_indices:
 
-                image_1 = images[
-                    frame_index - 1
-                ]
-
-                image_2 = images[
-                    frame_index + 1
-                ]
-
-                output[
-                    frame_index
-                ] = cls._repair_frame(
+                output[frame_index] = cls._repair_frame(
                     repair_method,
-                    image_1,
-                    image_2,
+                    source[frame_index - 1],
+                    source[frame_index + 1],
                 )
 
                 progress_bar.update(1)
@@ -929,7 +883,7 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         detected_entries = [
             entry
-            for entry in table
+            for entry in working_table
             if entry["detected"]
         ]
 
@@ -939,83 +893,50 @@ class SeedanceStutterFix(ComfyNodeABC):
 
         for entry in detected_entries:
 
-            # For:
-            #
             # A B B C
             #     ^
             #
-            # frame_index points to the SECOND B.
+            # frame_index points to the second B.
 
             frame_index = entry["frame"]
-
             selected_target = repair_target
 
             # ---------------------------------------------------------------------
-            # Auto-select which duplicate frame to replace.
+            # Auto
             # ---------------------------------------------------------------------
 
             if repair_target == "auto":
 
-                can_replace_first = (
-                    frame_index >= 2
-                )
+                can_replace_first = frame_index >= 2
+                can_replace_second = frame_index < frame_count - 1
 
-                can_replace_second = (
-                    frame_index < frame_count - 1
-                )
+                if can_replace_first and can_replace_second:
 
-                if (
-                    can_replace_first
-                    and can_replace_second
-                ):
-
-                    # table[n]["raw_diff"] describes:
-                    #
-                    # frame n-1 -> frame n
-                    #
-                    # Therefore:
-                    #
-                    # table[frame_index - 1]:
-                    #     A -> first B
-                    #
-                    # table[frame_index + 1]:
-                    #     second B -> C
-
-                    left_diff = table[
+                    left_motion = working_table[
                         frame_index - 1
-                    ]["raw_diff"]
+                    ]["motion"]
 
-                    right_diff = table[
+                    right_motion = working_table[
                         frame_index + 1
-                    ]["raw_diff"]
+                    ]["motion"]
 
-                    if left_diff > right_diff:
+                    if left_motion > right_motion:
                         selected_target = "AXBC"
                     else:
                         selected_target = "ABXC"
 
                 elif can_replace_first:
-
                     selected_target = "AXBC"
 
                 elif can_replace_second:
-
                     selected_target = "ABXC"
 
                 else:
-
                     progress_bar.update(1)
                     continue
 
             # ---------------------------------------------------------------------
             # AXBC
-            #
-            # Original:
-            #
-            # A B B C
-            #   ^
-            #
-            # Replace first B using A and second B.
             # ---------------------------------------------------------------------
 
             if selected_target == "AXBC":
@@ -1024,27 +945,18 @@ class SeedanceStutterFix(ComfyNodeABC):
                     progress_bar.update(1)
                     continue
 
-                repair_index = (
-                    frame_index - 1
-                )
+                repair_index = frame_index - 1
 
-                image_1 = images[
+                image_1 = output[
                     frame_index - 2
                 ]
 
-                image_2 = images[
+                image_2 = output[
                     frame_index
                 ]
 
             # ---------------------------------------------------------------------
             # ABXC
-            #
-            # Original:
-            #
-            # A B B C
-            #     ^
-            #
-            # Replace second B using first B and C.
             # ---------------------------------------------------------------------
 
             elif selected_target == "ABXC":
@@ -1055,21 +967,16 @@ class SeedanceStutterFix(ComfyNodeABC):
 
                 repair_index = frame_index
 
-                image_1 = images[
+                image_1 = output[
                     frame_index - 1
                 ]
 
-                image_2 = images[
+                image_2 = output[
                     frame_index + 1
                 ]
 
-            # ---------------------------------------------------------------------
-            # Repair selected frame.
-            # ---------------------------------------------------------------------
-
-            output[
-                repair_index
-            ] = cls._repair_frame(
+            # Immediately replace the frame in the current sequence.
+            output[repair_index] = cls._repair_frame(
                 repair_method,
                 image_1,
                 image_2,
@@ -1144,14 +1051,14 @@ class SeedanceStutterFix(ComfyNodeABC):
         # 1. Analyze
         # -------------------------------------------------------------------------
 
-        differences, continuity_scores = self._analyze_images(images)
+        motion, continuity_scores = self._analyze_images(images)
 
         # -------------------------------------------------------------------------
         # 2. Generate table
         # -------------------------------------------------------------------------
 
         table = self._generate_table(
-            differences,
+            motion,
             continuity_scores,
             similarity_threshold,
         )
